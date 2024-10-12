@@ -65,6 +65,10 @@ def read_jsonl_file_no_compress(file_path: Path):
 
 @contextmanager
 def write_jsonl_file(file_path: Path):
+    print(file_path)
+    
+    # [rangehow]: use lz4 for compressing
+    # debug use : with open(file_path, 'w') as file_:
     with lz4.frame.open(file_path, 'wb') as file_:
         with jsonlines.Writer(file_) as writer:  # type: ignore
             yield writer

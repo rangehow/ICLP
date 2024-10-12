@@ -1,6 +1,10 @@
+from dataclasses import dataclass
+from functools import partial
+import multiprocessing
+from einops import rearrange
 from joblib import delayed, Parallel
-from typing import List
-from omegaconf import DictConfig
+from typing import List, Optional
+from omegaconf import DictConfig, OmegaConf
 from rich.progress import track
 from pathlib import Path
 import pickle as pkl
@@ -15,11 +19,16 @@ import math
 import time
 import os
 from tqdm import tqdm
+from datasets import Dataset,load_dataset
+
+# rangehow: use sentence transformer instead of torch.hub
+from sentence_transformers import SentenceTransformer
+
 
 # TODO: pull these out of retrieval and break connection to that codebase
 import sys
-sys.path.append("/fsx-instruct-opt/swj0419/rlm_pretrain/hcir/retro-z/retro_z/RETRO-pytorch")
-from retro_pytorch.retrieval import tokenize, bert_embed
+sys.path.append("/mnt/rangehow/in-context-pretraining/build_embeds/RETRO-pytorch")
+# from retro_pytorch.retrieval import  bert_embed #,tokenize
 from chunk_logger import ChunkLogger, ChunkLoggerDummy
 
 
@@ -60,13 +69,99 @@ random.seed(88)
 np.random.seed(88)
 
 # TODO: get these from the tokenizer
-PAD_TOKEN = 0
-UNK_TOKEN = 100
-CLS_TOKEN = 101
-SEP_TOKEN = 102
-MASK_TOKEN = 103
+# [rangehow]: 已经从tokenizer里获取了
+@dataclass
+class TokenizerInfo:
+    pad_token: int
+    unk_token: int
+    cls_token: int
+    sep_token: int
+    mask_token: int
+    embed_dim: int
 
-EMBED_DIM = 768
+
+from transformers import AutoTokenizer,AutoConfig
+# [rangehow]: add this to initialize upper hyperparameter
+def get_tokenizer(tokenizer_cfg: DictConfig):
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_cfg["name"], trust_remote_code=True)
+    config = AutoConfig.from_pretrained(tokenizer_cfg["name"], trust_remote_code=True)
+    
+    tokenizer_info = TokenizerInfo(
+        pad_token=tokenizer.pad_token_id,
+        unk_token=tokenizer.unk_token_id,
+        cls_token=tokenizer.cls_token_id,
+        sep_token=tokenizer.sep_token_id,
+        mask_token=tokenizer.mask_token_id,
+        embed_dim=config.hidden_size
+    )
+    
+    return tokenizer, tokenizer_info
+
+
+
+def _tokenize_dataset(instance,tokenizer_cfg):
+    tokenizer,tokenizer_info = get_tokenizer(tokenizer_cfg)
+    tokenized_doc_outer = tokenizer.batch_encode_plus(instance["text"], add_special_tokens=True, padding=False,return_attention_mask=False,return_token_type_ids=False,truncation=True)
+
+
+    return {'tokens':tokenized_doc_outer.input_ids}
+
+
+def get_bert(
+    name: Optional[str] = None,
+    device: Optional[int]=None,
+)->SentenceTransformer:
+
+    
+    print(torch.cuda.is_available())
+    print(torch.cuda.device_count())
+    print(torch.cuda.current_device())
+    print("device",device)
+    model = SentenceTransformer(name,trust_remote_code=True,device=f"cuda:{device}" if device is not None else "cpu")
+    print(model.device)
+    return model
+
+
+
+
+@torch.no_grad()
+def bert_embed(token_ids, return_cls_repr=False, eps=1e-8, pad_id=0.0, model_config: Optional[DictConfig] = None,bert:SentenceTransformer=None):
+    
+    # if model is None:
+    #     model = get_bert(**model_config)
+    # else:
+    model = bert
+        
+    mask = token_ids != pad_id
+
+    # if torch.cuda.is_available():
+    token_ids = token_ids.to(model.device)
+    mask = mask.to(model.device)
+    print(model.device)
+    outputs = model(dict(input_ids=token_ids, attention_mask=mask))
+    # print(outputs.keys())
+    
+    # rangehow: 原始做法，先屏蔽了
+    # hidden_state = outputs.hidden_states[-1]
+    # hidden_state = outputs["token_embeddings"]
+    # bp()
+    # if return_cls_repr:
+    #     return hidden_state[:, 0]  # return [cls] as representation
+
+    # if mask is None:
+    #     return hidden_state.mean(dim=1)
+
+    # mask = mask[:, 1:]  # mean all tokens excluding [cls], accounting for length
+    # mask = rearrange(mask, "b n -> b n 1")
+
+    # numer = (hidden_state[:, 1:] * mask).sum(dim=1)
+    # denom = mask.sum(dim=1)
+    # masked_mean = numer / (denom + eps)
+    # return masked_mean
+    # bp()
+    return outputs["sentence_embedding"]
+
+
 
 JSONL_PAYLOAD = 'text'
 
@@ -94,8 +189,7 @@ CHUNK_BATCH_SIZE = 1024
 # >= 50 means print stdout
 JOBLIB_VERBOSITY = 50
 
-# swj
-MAX_TOKENS=510
+
 
 def _parallel(n_jobs=-1):
     # print("n_jobs: ", n_jobs)
@@ -104,53 +198,6 @@ def _parallel(n_jobs=-1):
     # return Parallel(n_jobs=1, verbose=JOBLIB_VERBOSITY)
 
 
-
-def _mask_after_eos(seq_tokens):
-    assert seq_tokens is not None, 'Failed test: seq_tokens is not None'
-
-    # mask out (with padding tokens) any token following an <eos> before the next sequence
-    # after_eos_id = np.cumsum(seq_tokens == SEP_TOKEN, axis=-1, dtype=np.int32)
-    # after_sos_id = np.cumsum(seq_tokens == CLS_TOKEN, axis=-1, dtype=np.int32)
-    # seq_mask = np.array(after_eos_id ^ after_sos_id, dtype=np.bool)  # type: ignore
-    seq_mask = (seq_tokens != PAD_TOKEN) & (seq_tokens != CLS_TOKEN)
-    # TODO: don't need to return seq_tokens
-    return seq_tokens, seq_mask
-
-
-def _generate_one_example(chunks_slice_modeling_relative: slice, chunks_slice_modeling_absolute: slice, current_chunks: np.ndarray, includes_last_chunk: bool, knns: np.ndarray,
-                          chunks_memmaps_retrieval, chunks_to_docs_retrieval: np.memmap, files_indices_retrieval, is_eval_dataset: bool, chunk_len: int, k_: int):
-    assert chunks_slice_modeling_relative.start < chunks_slice_modeling_relative.stop, f'Invalid chunks_slice_modeling_relative: {chunks_slice_modeling_relative}'
-    # assert chunk_len > 0 and chunk_len == 64, f'Invalid chunk_len: {chunk_len}'
-    assert chunks_memmaps_retrieval is not None, 'Failed test: chunks_memmaps_retrieval is not None'
-    assert files_indices_retrieval is not None, 'Failed test: files_indices_retrieval is not None'
-    assert k_ > 0 and (k_ == 2 or k_ == 5), f'Invalid k_: {k_}'
-
-    chunks = current_chunks[chunks_slice_modeling_relative]
-    seq_tokens = chunks.flatten()
-    assert len(seq_tokens == 2048), f'Invalid len(seq_tokens: {len(seq_tokens)}'
-
-    last_token = PAD_TOKEN if includes_last_chunk else current_chunks[chunks_slice_modeling_relative.stop][0].item()
-    target_tokens = np.concatenate((seq_tokens[1:], [last_token]), axis=-1, dtype=np.int32)
-
-    seq_tokens, seq_mask = _mask_after_eos(seq_tokens)
-    assert not (seq_tokens == PAD_TOKEN).all(), 'Invalid seq_tokens: all 0'
-
-    neighbors_of_chunks = knns[chunks_slice_modeling_absolute, :]
-    chunks_ids_absolute = np.arange(chunks_slice_modeling_absolute.start, chunks_slice_modeling_absolute.stop, dtype=np.uint32)
-
-    indices_of_retrieval_memmaps = list(files_indices_retrieval.values())
-    # swj: get neighbor and continuation tokens
-    neighbor_tokens = get_neighbors_and_continuations(chunks_ids_absolute, neighbors_of_chunks, chunks_memmaps_retrieval, chunks_to_docs_retrieval,  # type:ignore
-                                                      indices_of_retrieval_memmaps, chunk_len, k_, is_eval_dataset)
-    last_chunk_of_doc_flags = get_last_chunk_of_doc_flags(chunks_ids_absolute, chunks_to_docs_retrieval)
-
-    return {
-        'example_tokens': seq_tokens,
-        'example_mask': seq_mask,
-        'target_tokens': target_tokens,
-        'neighbor_tokens': neighbor_tokens,
-        'last_chunk_of_doc_flags': last_chunk_of_doc_flags,
-    }
 
 
 def _determine_num_chunks_per_seq(seq_len: int, chunk_len: int):
@@ -162,42 +209,6 @@ def _determine_num_chunks_per_seq(seq_len: int, chunk_len: int):
 
     return num_chunks_per_seq
 
-
-def _generate_examples_from_memmap_slice(chunks_memmap: np.memmap, memmap_chunks_slice: slice, chunks_index: int,
-                                         tfds_dir_path: Path, knns: np.memmap, chunks_memmaps: List[np.memmap],
-                                         chunks_to_docs: np.memmap, files_indices, chunk_len: int, seq_len: int, k_: int,
-                                         num_chunks_in_memmap: int):
-    assert memmap_chunks_slice.start < memmap_chunks_slice.stop
-    # assert chunk_len > 0 and chunk_len == 64
-    # assert seq_len > 0 and seq_len == 2048
-    assert files_indices is not None
-    assert num_chunks_in_memmap > 0
-    assert k_ > 0 and (k_ == 2 or k_ == 5)
-    assert chunks_index >= 0
-
-    num_chunks_per_seq = _determine_num_chunks_per_seq(seq_len, chunk_len)
-    start_chunk, end_chunk = memmap_chunks_slice.start, memmap_chunks_slice.stop
-    assert ((end_chunk - start_chunk) % num_chunks_per_seq) == 0
-
-    # shard_index = memmap_chunks_slice.start // CHUNK_BATCH_SIZE
-    # chunk_logger = ChunkLogger(chunk_len, seq_len, k_, tfds_dir_path, shard_index)
-
-    min_chunk_index, _, _ = list(files_indices.items())[chunks_index]
-    examples_list = []
-    for example_chunks_slice in range_chunked(end_chunk, num_chunks_per_seq, exact=True, min_value=start_chunk):
-        assert example_chunks_slice.stop <= num_chunks_in_memmap
-        # includes_last_chunk = example_chunks_slice.stop == num_chunks_in_memmap
-        # example_chunks_slice_absolute = slice(example_chunks_slice.start + min_chunk_index,
-        #                                       example_chunks_slice.stop + min_chunk_index)
-        breakpoint()
-        # FIXME:
-        # example = _generate_one_example(example_chunks_slice, example_chunks_slice_absolute, chunks_memmap,
-        #                                 includes_last_chunk, knns, chunks_memmaps, chunks_to_docs,
-        #                                 files_indices, chunk_len, k_)
-        # chunk_logger.log_example(example)
-        # examples_list.append(example)
-
-    return examples_list
 
 
 def _get_files_indices(embeddings_dir_path: Path):
@@ -316,41 +327,6 @@ def _add_ds_and_final_shard_to_filenames(tfds_dir_path: Path):
     time.sleep(60 * 1)
 
 
-def _write_tfds_metadata(tfds_dir_path: Path, shard_lengths: List[int], features, split: str):
-    import tensorflow_datasets as tfds
-
-    assert split in ['train', 'validation'], f'Invalid split: {split}'
-    split_infos = [tfds.core.SplitInfo(name=split, shard_lengths=shard_lengths, num_bytes=0)]  # type: ignore
-
-    with log('Writing tfds metadata'):
-        tfds.folder_dataset.write_metadata(
-            data_dir=f'{tfds_dir_path}',
-            features=features,
-            split_infos=split_infos,
-            filename_template='{DATASET}-{SPLIT}.{FILEFORMAT}-{SHARD_X_OF_Y}',
-            # TODO:
-            description='''Multi-line description.''',
-            homepage='http://my-project.org',
-            supervised_keys=('image', 'label'),
-            citation='''BibTex citation.''')
-
-
-def _write_tfds_records(tfds_dir_path: Path, shard_index: int, features, examples_list, split: str):
-    import tensorflow as tf
-
-    assert split in ['train', 'validation'], f'Invalid split: {split}'
-    assert examples_list is not None, 'Failed test: examples_list is not None'
-    assert shard_index >= 0, f'Invalid shard_index: {shard_index}'
-
-    # tfds blows up if filename has - outside of template
-    tfds_dataset_name = tfds_dir_path.parent.name.replace('-', '_')
-    with log(f'Writing tfrecord for shard index {shard_index} with {len(examples_list)} examples'):
-        tfrecord_path = tfds_dir_path / f'ds_{tfds_dataset_name}-{split}.tfrecord-{shard_index:>05d}'
-        with tf.io.TFRecordWriter(str(tfrecord_path)) as writer:
-            for example in examples_list:
-                # TODO: move into generation
-                example['neighbor_tokens'] = np.transpose(example['neighbor_tokens'], axes=[1, 0, 2])
-                writer.write(features.serialize_example(example))
 
 
 def _get_data_for_parallel_worker(modeling_chunks_index, chunks_dir_path_modeling, chunks_dir_path_retrieval,
@@ -379,80 +355,7 @@ def _get_data_for_parallel_worker(modeling_chunks_index, chunks_dir_path_modelin
     return chunks_memmaps_modeling, num_chunks_overall_modeling, files_indices_retrieval, chunks_memmaps_retrieval, chunks_to_docs_retrieval
 
 
-def _generate_and_write_tfds_examples_from_slice(shard_index, modeling_chunks_slice, modeling_chunks_index, knns_dir_path, tfds_dir_path, chunk_len, seq_len, k_, K,
-                                                 num_chunks_in_memmap, min_chunk_index, split, chunks_memmaps_modeling, num_chunks_overall_modeling,
-                                                 files_indices_retrieval, chunks_memmaps_retrieval, chunks_to_docs_retrieval, log_every_num_chunks: int):
-    assert log_every_num_chunks != 0, 'log_every_num_chunks != 0'
-    start_chunk, end_chunk = modeling_chunks_slice.start, modeling_chunks_slice.stop
-    num_chunks_per_seq = _determine_num_chunks_per_seq(seq_len, chunk_len)
-    assert end_chunk > start_chunk, f'Invalid start_chunks ({start_chunk}) or end_chunk ({end_chunk})'
 
-    chunk_logger = ChunkLogger(chunk_len, seq_len, k_, tfds_dir_path, shard_index)
-
-    chunks_memmap_modeling = chunks_memmaps_modeling[modeling_chunks_index]
-    with memmap(knns_dir_path / KNNS_FILENAME, dtype=np.uint32, mode='r') as knns_flat:
-        with log(f'Reshaping knns array from {knns_dir_path / KNNS_FILENAME}'):
-            knns, num_knns_rows = reshape_memmap_given_width(knns_flat, K)
-        assert num_chunks_overall_modeling == num_knns_rows, f'{num_chunks_overall_modeling} == {num_knns_rows}'
-
-        examples_list = []
-        for index, example_chunks_slice in enumerate(range_chunked(end_chunk, num_chunks_per_seq, exact=True, min_value=start_chunk)):
-            assert example_chunks_slice.stop <= num_chunks_in_memmap, f'Invalid example_chunks_slice({example_chunks_slice}) or num_chunks_in_memmap ({num_chunks_in_memmap})'
-            includes_last_chunk = example_chunks_slice.stop == num_chunks_in_memmap
-            example_chunks_slice_absolute = slice(example_chunks_slice.start + min_chunk_index,
-                                                  example_chunks_slice.stop + min_chunk_index)
-            logging.debug(f'Generating example for absolute slice {example_chunks_slice_absolute} '
-                          f'and relative slice {example_chunks_slice}')
-
-            example = _generate_one_example(example_chunks_slice, example_chunks_slice_absolute, chunks_memmap_modeling, includes_last_chunk, knns,  # type: ignore
-                                            chunks_memmaps_retrieval, chunks_to_docs_retrieval, files_indices_retrieval, split == 'validation', chunk_len, k_)
-            if (index % log_every_num_chunks) == 0:
-                chunk_logger.log_example(example, flush=False)
-            examples_list.append(example)
-
-    features = _get_tfds_features(seq_len, chunk_len, k_)
-    _write_tfds_records(tfds_dir_path, shard_index, features, examples_list, split)
-
-    return len(examples_list)
-
-
-def _tfds_parallel_cpu_worker(shard_index: int, modeling_chunks_slice: slice, modeling_chunks_index: int,
-                              chunks_dir_path_modeling: Path, chunks_dir_path_retrieval: Path,
-                              embeds_dir_path_modeling: Path, embeds_dir_path_retrieval: Path, knns_dir_path: Path,
-                              tfds_dir_path: Path, chunk_len: int, seq_len: int, k_: int, K: int,  # noqa: N803
-                              num_chunks_in_memmap: int, min_chunk_index: int, split: str, log_every_num_chunks: int):
-    init_logging()
-    # bp()
-    try:
-        logging.info('CPU worker checking parameters')
-
-        # assert chunk_len > 0 and chunk_len == 64, f'Invalid chunk_len: {chunk_len}'
-        assert split in ['train', 'validation'], f'Invalid split: {split}'
-        # assert seq_len > 0 and seq_len == 2048, f'Invalid seq_len: {seq_len}'
-        assert modeling_chunks_index >= 0, f'Invalid modeling_chunks_index: {modeling_chunks_index}'
-        assert num_chunks_in_memmap > 0, f'Invalid num_chunks_in_memmap: {num_chunks_in_memmap}'
-        assert k_ > 0 and (k_ == 2 or k_ == 5), f'Invalid k_: {k_}'
-        assert K > k_ and K == 50, f'Invalid K: {K}'
-        assert shard_index >= 0, f'Invalid shard_index: {shard_index}'
-        assert log_every_num_chunks != 0, 'log_every_num_chunks != 0'
-
-        logging.info(f'CPU worker processing shard index {shard_index}, slice ({modeling_chunks_slice.start}, {modeling_chunks_slice.stop})')
-
-        chunks_memmaps_modeling, num_chunks_overall_modeling, files_indices_retrieval, chunks_memmaps_retrieval, chunks_to_docs_retrieval = \
-            _get_data_for_parallel_worker(modeling_chunks_index, chunks_dir_path_modeling, chunks_dir_path_retrieval,
-                                          embeds_dir_path_modeling, embeds_dir_path_retrieval, tfds_dir_path, chunk_len, split)
-        # bp()
-        examples_len = _generate_and_write_tfds_examples_from_slice(shard_index, modeling_chunks_slice, modeling_chunks_index, knns_dir_path,
-                                                                    tfds_dir_path, chunk_len, seq_len, k_, K, num_chunks_in_memmap,
-                                                                    min_chunk_index, split, chunks_memmaps_modeling, num_chunks_overall_modeling,
-                                                                    files_indices_retrieval, chunks_memmaps_retrieval, chunks_to_docs_retrieval,
-                                                                    log_every_num_chunks)
-    except Exception as ex:
-        logging.critical(f'Error in CPU worker:\n{ex}')
-        logging.critical(traceback.format_exc())
-        raise ex
-
-    return examples_len
 
 
 def _create_num_cpus_chunk_aligned_batches(modeling_chunks_slice: slice, num_chunks_per_seq: int):
@@ -468,36 +371,6 @@ def _create_num_cpus_chunk_aligned_batches(modeling_chunks_slice: slice, num_chu
     return batches
 
 
-# TODO: check params (inside try)
-def _tfds_parallel_node_worker(shard_index: int, modeling_chunks_slice: slice, modeling_chunks_index: int,
-                               chunks_dir_path_modeling: Path, chunks_dir_path_retrieval: Path,
-                               embeds_dir_path_modeling: Path, embeds_dir_path_retrieval: Path, knns_dir_path: Path,
-                               tfds_dir_path: Path, chunk_len: int, seq_len: int, k_: int, K: int,  # noqa: N803
-                               num_chunks_in_memmap: int, min_chunk_index: int, split: str, log_every_num_chunks: int):
-    results = []
-    try:
-        num_chunks_per_seq = _determine_num_chunks_per_seq(seq_len, chunk_len)
-        batches = _create_num_cpus_chunk_aligned_batches(modeling_chunks_slice, num_chunks_per_seq)
-        logging.info(f'Processing batches {batches}')
-
-        assert len(batches) <= NUM_CPUS_PER_NODE, f'Number of CPUs {NUM_CPUS_PER_NODE} != number of jobs {len(batches)}'
-        # if the sub-slice length is less than 320 (what's required to 32-align on 10 CPUs) i.e. overall slice length is < 3200
-        # we won't the optimal number of jobs
-        if len(batches) < NUM_CPUS_PER_NODE:
-            logging.warning(f'Number of CPUs {NUM_CPUS_PER_NODE} < number of jobs {len(batches)}. Probably slice length is < 320 * 10 ({modeling_chunks_slice.stop - modeling_chunks_slice.start}).')
-
-        results = _parallel(n_jobs=NUM_CPUS_PER_NODE)(delayed(_tfds_parallel_cpu_worker)(shard_index + node_index, cpu_slice, modeling_chunks_index,
-                                                                                         chunks_dir_path_modeling, chunks_dir_path_retrieval,
-                                                                                         embeds_dir_path_modeling, embeds_dir_path_retrieval,
-                                                                                         knns_dir_path, tfds_dir_path, chunk_len, seq_len, k_, K,
-                                                                                         num_chunks_in_memmap, min_chunk_index, split, log_every_num_chunks)
-                                                      for node_index, cpu_slice in enumerate(batches))
-    except Exception as ex:
-        logging.critical(f'Error in node worker:\n{ex}')
-        logging.critical(traceback.format_exc())
-        raise ex
-
-    return results
 
 
 def _round_to_multiple(number: int, multiple: int, direction: str):
@@ -508,165 +381,8 @@ def _round_to_multiple(number: int, multiple: int, direction: str):
         return multiple * math.floor(number / multiple)
 
 
-def _submit_tfds_jobs_for_chunks_memmap(executor, base_shard_index: int, tfds_dir_path: Path, chunks_dir_path_modeling: Path, chunks_dir_path_retrieval: Path,
-                                        embeds_dir_path_modeling: Path, embeds_dir_path_retrieval: Path, knns_dir_path: Path, chunk_len: int, seq_len: int,
-                                        k_: int, K: int, num_workers_per_file: int, chunks_filename: str, indices, split: str, log_every_num_chunks: int):  # noqa: N803
-    min_chunk_index, max_chunk_index, chunks_memmap_index = indices
-
-    assert max_chunk_index > min_chunk_index
-    # assert chunk_len > 0 and chunk_len == 64
-    assert split in ['train', 'validation']
-    # assert seq_len > 0 and seq_len == 2048
-    assert len(chunks_filename) > 0
-    assert num_workers_per_file > 0
-    assert chunks_memmap_index >= 0
-    assert base_shard_index >= 0
-    assert min_chunk_index >= 0
-    assert k_ > 0 and (k_ == 2 or k_ == 5)
-    assert K > k_
-    assert log_every_num_chunks > 0
-
-    weighted_workers = num_workers_per_file
-    for substr, weighting in WORKERS_PER_FILE_WEIGHTINGS.items():
-        if substr in chunks_filename:
-            weighted_workers = int(np.ceil(num_workers_per_file * weighting))
-            break
-    logging.info(f'Distributing to weighted number of workers: {weighted_workers}')
-
-    num_chunks_in_memmap = max_chunk_index - min_chunk_index
-    batch_size = _round_to_multiple(max_chunk_index / weighted_workers, 1, 'up')
-    logging.info(f'Processing from chunk {min_chunk_index} to {max_chunk_index} with batch size {batch_size}')
-
-    shard_index = base_shard_index
-    jobs = []
-
-    for chunks_slice in range_chunked(num_chunks_in_memmap, batch_size):
-        if (chunks_slice.stop - chunks_slice.start) * _determine_num_chunks_per_seq(seq_len, chunk_len) < NUM_CPUS_PER_NODE:
-            logging.info(f'Skipping slice {chunks_slice} as too small for #CPUS')
-        else:
-            logging.info(f'Submitting job on slice {chunks_slice} with shard index {shard_index}')
-            worker_fn = WorkerFunctor(_tfds_parallel_node_worker, shard_index, chunks_slice,
-                                      chunks_memmap_index, chunks_dir_path_modeling, chunks_dir_path_retrieval,
-                                      embeds_dir_path_modeling, embeds_dir_path_retrieval, knns_dir_path,
-                                      tfds_dir_path, chunk_len, seq_len, k_, K, num_chunks_in_memmap, min_chunk_index,
-                                      split, log_every_num_chunks)
-            job = executor.submit(worker_fn)
-            jobs.append(job)
-            shard_index += NUM_CPUS_PER_NODE
-
-    logging.info(f'Submitted {len(jobs)} jobs for file')
-    assert shard_index - base_shard_index == len(jobs) * NUM_CPUS_PER_NODE
-    return jobs, shard_index - base_shard_index
 
 
-# TODO: wildly refactor this function and caller
-def _get_chunks_data_for_tfds_jobs(chunks_dir_path, embeddings_dir_path, chunk_len):
-    with log('Loading files indices'):
-        files_indices, num_chunks_overall = _get_files_indices(embeddings_dir_path)
-
-    chunks_memmaps = _get_chunks_memmaps(chunks_dir_path, files_indices, chunk_len)
-
-    return files_indices, chunks_memmaps, num_chunks_overall
-
-
-def chunks_and_knns_to_tfds_dataset_parallel(tfds_dir_path: Path, chunks_dir_path_modeling, chunks_dir_path_retrieval,
-                                             embeds_dir_path_modeling, embeds_dir_path_retrieval,
-                                             knns_dir_path: Path, chunk_len: int, seq_len: int, K: int, k_: int,  # noqa: N803
-                                             parallel_cfg: DictConfig, split: str, log_every_num_chunks: int):
-    assert exists_and_is_dir(chunks_dir_path_retrieval)
-    assert exists_and_is_dir(embeds_dir_path_retrieval)
-    assert exists_and_is_dir(chunks_dir_path_modeling)
-    assert exists_and_is_dir(embeds_dir_path_modeling)
-    assert exists_and_is_dir(tfds_dir_path)
-    assert exists_and_is_dir(knns_dir_path)
-    # assert chunk_len > 0 and chunk_len == 64
-    assert split in ['train', 'validation']
-    # assert seq_len > 0 and seq_len == 2048
-    assert k_ > 0 and (k_ == 2 or k_ == 5)
-    assert K > k_ and K == 50
-    assert log_every_num_chunks > 0
-
-    files_indices_modeling, chunks_memmaps_modeling, num_chunks_overall_modeling = _get_chunks_data_for_tfds_jobs(chunks_dir_path_modeling, embeds_dir_path_modeling, chunk_len)
-
-    if split == 'validation':
-        assert chunks_dir_path_modeling != chunks_dir_path_retrieval
-        assert embeds_dir_path_modeling != embeds_dir_path_retrieval
-        files_indices_retrieval, _, num_chunks_overall_retrieval = _get_chunks_data_for_tfds_jobs(chunks_dir_path_retrieval, embeds_dir_path_retrieval, chunk_len)
-    else:
-        assert chunks_dir_path_modeling == chunks_dir_path_retrieval
-        assert embeds_dir_path_modeling == embeds_dir_path_retrieval
-        files_indices_retrieval, num_chunks_overall_retrieval = files_indices_modeling, num_chunks_overall_modeling
-
-    with log('Creating aggregate docs map'):
-        chunks_to_docs = _create_aggregate_docs_map(tfds_dir_path, chunks_dir_path_retrieval, files_indices_retrieval, num_chunks_overall_retrieval)
-        assert len(chunks_to_docs) == num_chunks_overall_retrieval
-
-    all_jobs = []
-    base_shard_index, total_shards = 0, 0
-    # bp()
-    executor = create_executor(parallel_cfg.submitit)
-    with executor.batch():
-        logging.info(f'Submitting jobs for {len(chunks_memmaps_modeling)} chunks files')  # type:ignore
-        for chunks_filename, indices in files_indices_modeling.items():  # type:ignore
-            logging.info(f'Submitting jobs for {chunks_filename} with base shard index {base_shard_index} and indices {indices}')
-            memmap_jobs, total_shards = _submit_tfds_jobs_for_chunks_memmap(executor, base_shard_index, tfds_dir_path, chunks_dir_path_modeling, chunks_dir_path_retrieval,
-                                                                            embeds_dir_path_modeling, embeds_dir_path_retrieval, knns_dir_path, chunk_len, seq_len, k_, K,
-                                                                            parallel_cfg.num_workers_per_file, chunks_filename, indices, split, log_every_num_chunks)
-            all_jobs.extend(memmap_jobs)
-            base_shard_index += total_shards
-    logging.info(f'Submitted {len(all_jobs)} jobs')
-
-    try:
-        with log('Waiting for jobs to complete'):
-            await_completion_of_jobs(all_jobs)
-        with log('Fetching and validating results'):
-            shard_lengths = fetch_and_validate_neighbors_results(all_jobs)
-            features = _get_tfds_features(seq_len, chunk_len, k_)
-            _add_ds_and_final_shard_to_filenames(tfds_dir_path)
-            _write_tfds_metadata(tfds_dir_path, shard_lengths, features, split)
-    except Exception as e:
-        logging.critical(f'Error while awaiting/fetching/merging results. Cannot write metadata:\n{e}')
-
-
-# TODO: dispose of chunks memmaps and chunks_to_docs (as well as underlying storage)
-# TODO: probably batching doesn't achieve anything in serial?
-# TODO: more logging, here and in called functions
-def chunks_and_knns_to_tfds_dataset_serial(tfds_dir_path: Path, chunks_dir_path: Path, embeddings_dir_path: Path,
-                                           knns_dir_path: Path, chunk_len: int, seq_len: int, K: int, k_: int, split: str):  # noqa: N803
-    # TODO: update this function to log critical on failure
-    assert exists_and_is_dir(chunks_dir_path); assert exists_and_is_dir(tfds_dir_path)
-    assert exists_and_is_dir(knns_dir_path)
-    # assert chunk_len > 0 and chunk_len == 64
-    # assert seq_len > 0 and seq_len == 2048
-    assert split in ['train', 'validation']
-    assert k_ > 0 and (k_ == 2 or k_ == 5)
-    assert K > k_ and K == 50
-
-    num_chunks_per_seq, mod = divmod(seq_len, chunk_len)
-    assert mod == 0
-
-    files_indices, num_chunks_overall = _get_files_indices(embeddings_dir_path)
-
-    with memmap(knns_dir_path / KNNS_FILENAME, dtype=np.int32, mode='r') as knns_flat:
-        knns, num_knns_rows = reshape_memmap_given_width(knns_flat, K)
-        assert num_chunks_overall == num_knns_rows
-        chunks_memmaps, = _get_chunks_memmaps(chunks_dir_path, files_indices, chunk_len)
-        chunks_to_docs = _create_aggregate_docs_map(tfds_dir_path, chunks_dir_path, files_indices, num_chunks_overall)
-
-        with log(f'Processing {len(chunks_memmaps)} chunks files'):  # type: ignore
-            examples_list = []
-            for chunks_index, chunks_memmap in enumerate(chunks_memmaps):  # type: ignore
-                final_chunk = _round_to_multiple(len(chunks_memmap), num_chunks_per_seq, 'down')  # type: ignore
-                for chunks_slice in range_chunked(final_chunk, CHUNK_BATCH_SIZE):
-                    examples = _generate_examples_from_memmap_slice(chunks_memmap, chunks_slice, chunks_index, tfds_dir_path,
-                                                                    knns, chunks_memmaps, chunks_to_docs,  # type: ignore
-                                                                    files_indices, chunk_len, seq_len, k_, num_chunks_overall)
-                    examples_list.extend(examples)
-
-    features = _get_tfds_features(seq_len, chunk_len, k_)
-    _write_tfds_records(tfds_dir_path, 0, features, examples_list, split)
-    _add_ds_and_final_shard_to_filenames(tfds_dir_path)
-    _write_tfds_metadata(tfds_dir_path, [len(examples_list)], features, split)
 
 
 def _convert_to_gpu_index(cpu_index: faiss.Index) -> faiss.Index:
@@ -887,56 +603,72 @@ def _create_map_and_key(embeddings_dir_path: Path, embed_dim: int):
             pkl.dump(filename_to_indices, key_file)
 
 
-def _embed_chunk_batch(chunk_batch, model):
-    # bp()
+def _embed_chunk_batch(chunk_batch, model,tokenizer_info:TokenizerInfo,bert:SentenceTransformer):
+
     # weijia hard code
     # chunk_batch = chunk_batch[:, :510]
-    padded_batch = np.concatenate((chunk_batch, np.full((chunk_batch.shape[0], 2), PAD_TOKEN)), axis=1)
-    padded_batch_ori = padded_batch.copy()
+    # rangehow：这段拼俩是干啥的……？给special tokens腾位置啊？
+    # padded_batch = np.concatenate((chunk_batch, np.full((chunk_batch.shape[0], 2), tokenizer_info.pad_token)), axis=1)
+    padded_batch= chunk_batch
+    # padded_batch_ori = padded_batch.copy()
 
     for index, _ in enumerate(padded_batch):
-        if padded_batch[index, 0] != CLS_TOKEN:
+        # 如果序列开头不是CLS，就集体往后挪一个位置，然后把第一个词变成CLS，这个会丢弃原始的最后一个词。
+        if padded_batch[index, 0] != tokenizer_info.cls_token:
             padded_batch[index] = np.roll(padded_batch[index], 1)
-            padded_batch[index, 0] = CLS_TOKEN
+            padded_batch[index, 0] = tokenizer_info.cls_token
 
-        if SEP_TOKEN not in padded_batch[index]:
-            pad_indices = np.where(padded_batch[index] == PAD_TOKEN)
+        # 如果SEP不在，就把第一个pad给替换成sep，否则报错。
+        if tokenizer_info.sep_token not in padded_batch[index]:
+            pad_indices = np.where(padded_batch[index] == tokenizer_info.sep_token)
             assert len(pad_indices) == 1
             pad_indices = pad_indices[0]
-            padded_batch[index, pad_indices[0]] = SEP_TOKEN
+            padded_batch[index, pad_indices[0]] = tokenizer_info.sep_token
     # bp()
     # print("padded_batch: ", padded_batch)
     padded_batch_torch = torch.from_numpy(padded_batch)
+    # print(padded_batch_torch[padded_batch_torch!=0])
+    # print("padded_batch_torch.shape[1]",padded_batch_torch.shape[1])
     assert padded_batch_torch.shape[1] <= 512
 
-    # bp()
-    batch_embed = bert_embed(padded_batch_torch, model_config=model)
+    batch_embed = bert_embed(padded_batch_torch, model_config=model,bert=bert)
     return batch_embed
 
 
 def _parallel_embed(chunks_file_path: Path, embeds_file_path: Path, batch_size: int, num_workers: int,
-                    worker_id: int, model: DictConfig, chunk_len: int):
+                    worker_id: int, model: DictConfig, chunk_len: int,tokenizer_info):
+    
+    # 理论上，这是一个进程的内部
     assert exists_and_is_file(chunks_file_path)
     assert not embeds_file_path.is_dir()
     assert batch_size > 0
     assert num_workers > 0
+    
+
     # assert chunk_len > 0 and chunk_len == 64
     assert model
 
     with memmap(chunks_file_path, np.int32, 'r') as chunks_flat:
         num_chunks, mod = divmod(len(chunks_flat), chunk_len)
         assert num_chunks > 0 and mod == 0
+
+        # 需要reshape是因为这个文件保存在本地似乎是平铺开的，按np.int32去解会得到一个一维的张量
         chunks = chunks_flat.reshape(num_chunks, chunk_len)
 
+        # 找准这个进程需要处理的范围，然后在下面根据bsz去推断。
         shard_size = math.ceil(num_chunks / num_workers)
         start, end = shard_size * worker_id, shard_size * (worker_id + 1)
         shard = chunks[start:end]
 
         emb_list = []
+
+
+        OmegaConf.update(model, "device", worker_id, merge=True)
+        bert = get_bert(**model)
         with log(f'Worker {worker_id} processing chunks {start} to {end}'):
             for row in range(0, shard_size, batch_size):
                 batch_chunk_npy = shard[row:row + batch_size]
-                batch_embed = _embed_chunk_batch(batch_chunk_npy, model)
+                batch_embed = _embed_chunk_batch(batch_chunk_npy, model,tokenizer_info,bert)
                 emb_list.append(batch_embed.detach().cpu().numpy())
             embeddings = np.vstack(emb_list)
 
@@ -947,16 +679,35 @@ def _parallel_embed(chunks_file_path: Path, embeds_file_path: Path, batch_size: 
     return num_chunks, embeddings.shape[0]
 
 
+
+
+
+
 def _parallel_chunks_file_to_embed_file(chunks_file_path: Path, embeds_file_path: Path, batch_size: int, model: DictConfig,
-                                        chunk_len: int, embed_dim: int, parallel_cfg: DictConfig):
+                                        chunk_len: int , parallel_cfg: DictConfig,tokenizer_info:TokenizerInfo):
+    """单文件的处理程序，在这里变成多进程很合适。
+
+    Args:
+        chunks_file_path (Path): _description_
+        embeds_file_path (Path): _description_
+        batch_size (int): _description_
+        model (DictConfig): _description_
+        chunk_len (int): _description_
+        embed_dim (int): _description_
+        parallel_cfg (DictConfig): _description_
+        tokenizer_info (TokenizerInfo): _description_
+    """
     assert exists_and_is_file(chunks_file_path)
     assert not embeds_file_path.is_dir()
     assert batch_size > 0
-    assert embed_dim > 0
+    # assert embed_dim > 0
     # assert chunk_len > 0 and chunk_len == 64
     assert parallel_cfg
     assert model
-    print("asdasdsa")
+
+    # rangehow: 不允许workers的数量超过gpu数量，因为我强行要求一个worker绑一个device（如果有gpu的话）
+    assert parallel_cfg.num_workers<=torch.cuda.device_count()
+    
     with log(f'Processing file {chunks_file_path.name}'):
         num_workers = parallel_cfg.num_workers
 
@@ -966,7 +717,7 @@ def _parallel_chunks_file_to_embed_file(chunks_file_path: Path, embeds_file_path
             with executor.batch():
                 for worker_id in range(num_workers):
                     worker_fn = WorkerFunctor(_parallel_embed, chunks_file_path, embeds_file_path,
-                                              batch_size, num_workers, worker_id, model, chunk_len)
+                                              batch_size, num_workers, worker_id, model, chunk_len,tokenizer_info)
                     job = executor.submit(worker_fn)
                     jobs.append(job)
 
@@ -976,8 +727,8 @@ def _parallel_chunks_file_to_embed_file(chunks_file_path: Path, embeds_file_path
             with log('Fetching and validating results'):
                 processed_chunks = fetch_and_validate_embedding_results(jobs)
 
-            with log('Merging shards'):
-                with memmap(embeds_file_path, np.float32, 'w+', shape=(processed_chunks, embed_dim)) as embeds:
+            with log(f'Merging shards into {embeds_file_path}'):
+                with memmap(embeds_file_path, np.float32, 'w+', shape=(processed_chunks, tokenizer_info.embed_dim)) as embeds:
                     embeds_index = 0
                     for worker_id in track(range(num_workers)):
                         shard_filename = Path(str(embeds_file_path) + f'_{worker_id}_{num_workers}.npy')
@@ -990,63 +741,52 @@ def _parallel_chunks_file_to_embed_file(chunks_file_path: Path, embeds_file_path
 
 
 def parallel_chunks_files_to_embeds_files(chunks_dir_path: Path, embeds_dir_path: Path, batch_size: int, model: DictConfig,
-                                          embed_dim: int, chunk_len: int, parallel_cfg: DictConfig):
+                                           chunk_len: int, parallel_cfg: DictConfig,tokenizer_info:TokenizerInfo):
     assert exists_and_is_dir(chunks_dir_path)
     assert exists_and_is_dir(embeds_dir_path)
     assert batch_size > 0
-    assert embed_dim > 0
-    # assert chunk_len > 0 and chunk_len == 64
+
     assert parallel_cfg
     assert model
-    # print("chunks_dir_path: ", chunks_dir_path)
-    # print(list(chunks_dir_path.glob(NPY_GLOB)))
+
     chunks_file_paths = sorted(list(chunks_dir_path.glob(NPY_GLOB)))
 
-    # # swj hard code: filter out the files that have been processed
-    # new_chunks_file_paths = []
-    # for chunks_file_path in chunks_file_paths:
-    #     for id in range(23, 24):
-    #         if str(id) in chunks_file_path.name:
-    #             new_chunks_file_paths.append(chunks_file_path)
-    #             continue
-    chunks_file_paths = chunks_file_paths
-    # print("chunks_file_paths: ", chunks_file_paths)
-    # bp()
+    
     with log(f'Processing {len(chunks_file_paths)} chunks files'):
         for chunks_file_path in chunks_file_paths:
             _parallel_chunks_file_to_embed_file(chunks_file_path, embeds_dir_path / chunks_file_path.name,
-                                                batch_size, model, chunk_len, embed_dim, parallel_cfg)
+                                                batch_size, model, chunk_len,parallel_cfg,tokenizer_info)
 
-    # swj change
-    # _create_map_and_key(embeds_dir_path, embed_dim)
 
 
 def _chunks_file_to_embed_file(chunks_file_path: Path, embeds_file_path: Path, model: DictConfig,
-                               chunk_len: int, batch_size: int, embed_dim: int):
+                               chunk_len: int, batch_size: int, embed_dim: int,tokenizer_info:TokenizerInfo):
     assert exists_and_is_file(chunks_file_path)
     assert not embeds_file_path.is_dir()
     assert batch_size > 0
-    assert embed_dim > 0
     assert model
 
+
+    
+    bert = get_bert(**model)
     with log(f'Processing {chunks_file_path.name}'):
         with memmap(chunks_file_path, np.int32, 'r') as chunks_flat:
             # bp()
             chunks, num_chunks = reshape_memmap_given_width(chunks_flat, chunk_len)
 
-            with memmap(embeds_file_path, np.float32, 'w+', shape=(num_chunks, embed_dim)) as embeds:
+            with memmap(embeds_file_path, np.float32, 'w+', shape=(num_chunks, tokenizer_info.embed_dim)) as embeds:
                 for slice_ in range_chunked(num_chunks, batch_size):
                     chunk_batch = chunks[slice_]
-                    embed_batch = _embed_chunk_batch(chunk_batch, model)
+                    embed_batch = _embed_chunk_batch(chunk_batch, model,tokenizer_info,bert=bert)
                     embeds[slice_] = embed_batch.cpu()
 
 
 def chunks_files_to_embeds_files(chunks_dir_path: Path, embeds_dir_path: Path, model: DictConfig,
-                                 chunk_len: int, batch_size: int, embed_dim: int):
+                                 chunk_len: int, batch_size: int, tokenizer_info:TokenizerInfo):
     assert exists_and_is_dir(chunks_dir_path)
     assert exists_and_is_dir(embeds_dir_path)
     assert batch_size > 0
-    assert embed_dim > 0
+    # assert embed_dim > 0
     # assert chunk_len > 0 and chunk_len == 64
     assert model
 
@@ -1055,12 +795,12 @@ def chunks_files_to_embeds_files(chunks_dir_path: Path, embeds_dir_path: Path, m
     with log(f'Processing {len(chunks_file_paths)} chunks files'):
         for chunks_file_path in chunks_file_paths:
             _chunks_file_to_embed_file(chunks_file_path, embeds_dir_path / chunks_file_path.name,
-                                       model, chunk_len, batch_size, embed_dim)
+                                       model, chunk_len, batch_size, tokenizer_info.embed_dim,tokenizer_info)
 
-    _create_map_and_key(embeds_dir_path, embed_dim)
+    _create_map_and_key(embeds_dir_path, tokenizer_info.embed_dim)
 
 
-def _create_chunks_and_map(tokens_file_path: Path, chunks_file_path: Path, chunk_len: int, total_chunks: int):
+def _create_chunks_and_map(tokens_file_path: Path, chunks_file_path: Path, chunk_len: int, total_chunks: int,tokenizer_info:TokenizerInfo):
     assert exists_and_is_file(tokens_file_path)
     assert not chunks_file_path.is_dir()
     print("tokens_file_path: ", tokens_file_path, "total_chunks: ", total_chunks)
@@ -1068,8 +808,8 @@ def _create_chunks_and_map(tokens_file_path: Path, chunks_file_path: Path, chunk
     # assert chunk_len > 0 and chunk_len == 64
 
     with read_jsonl_file(tokens_file_path) as tokens_reader, \
-         memmap(chunks_file_path, np.int32, 'w+', shape=(total_chunks, chunk_len)) as chunks, \
-         memmap(str(chunks_file_path) + MAP_SUFFIX, np.int32, 'w+', shape=(total_chunks,)) as chunks_map:
+        memmap(chunks_file_path, np.int32, 'w+', shape=(total_chunks, chunk_len)) as chunks, \
+        memmap(str(chunks_file_path) + MAP_SUFFIX, np.int32, 'w+', shape=(total_chunks,)) as chunks_map:
         print("tokens_file_path: ", tokens_file_path)
         chunk_index = 0
         # each line in tokens file maps to equivalent line in documents file and so line index == doc_index
@@ -1090,16 +830,27 @@ def _create_chunks_and_map(tokens_file_path: Path, chunks_file_path: Path, chunk
             #     # TODO this is a bit duplicative of "discarding" check/log below - remove it when confident
             #     logging.warn(f'No tokens found while processing doc {doc_index} in file {tokens_file_path.name} - not discarding')
             # bp()
+            
+            # [rangehow]: 这个地方要求一个文档的tokens在chunk_len之内是因为分词时已经做了强制截断了。
             div, mod = divmod(len(tokens), chunk_len)
+            # [rangehow]: 思考一下……，这里其实很麻烦，pad的目的是要齐，但是这个补到maxlen的chunk_len可能不如doc长
+
             if mod != 0:
-                tokens.extend([PAD_TOKEN] * (chunk_len - mod))
+                tokens.extend([tokenizer_info.pad_token] * (chunk_len - mod))
                 div += 1
+            
+            
+            # [rangehow]: 解除一个文档只能映射到一个chunk上的限制
             if div != 1:
                 bp()
             assert div == 1
             for doc_chunk_index in range(div):
                 tokens_slice = slice(doc_chunk_index * chunk_len, (doc_chunk_index + 1) * chunk_len)
-                chunks[chunk_index] = tokens[tokens_slice]
+                try:
+                    chunks[chunk_index] = tokens[tokens_slice]
+                except Exception as e:
+                    print(e)
+                    bp()
                 chunks_map[chunk_index] = doc_index
                 chunk_index += 1
             # print("chunk_index: ", chunk_index, "doc_id: ", line["doc_id"])
@@ -1107,7 +858,7 @@ def _create_chunks_and_map(tokens_file_path: Path, chunks_file_path: Path, chunk
     assert chunk_index == total_chunks
 
 
-def _tokens_file_to_chunks_files(tokens_file_path: Path, chunks_file_path: Path, chunk_len: int):
+def _tokens_file_to_chunks_files(tokens_file_path: Path, chunks_file_path: Path, chunk_len: int,tokenizer_info):
     assert exists_and_is_file(tokens_file_path)
     assert not chunks_file_path.is_dir()
     # assert chunk_len > 0 and chunk_len == 512
@@ -1125,16 +876,17 @@ def _tokens_file_to_chunks_files(tokens_file_path: Path, chunks_file_path: Path,
                     total_chunks += (div if mod == 0 else div + 1)
 
         with log('Creating chunks and chunks map'):
-            _create_chunks_and_map(tokens_file_path, chunks_file_path, chunk_len, total_chunks)
+            _create_chunks_and_map(tokens_file_path, chunks_file_path, chunk_len, total_chunks,tokenizer_info)
 
 
-def tokens_files_to_chunks_files(tokens_dir_path: Path, chunks_dir_path: Path, chunk_len: int):
+def tokens_files_to_chunks_files(tokens_dir_path: Path, chunks_dir_path: Path, chunk_len: int,tokenizer_info):
+
     assert exists_and_is_dir(tokens_dir_path) and exists_and_is_dir(chunks_dir_path)
     # assert chunk_len > 0 and chunk_len == 512
 
     # swj change
     tokens_file_paths = sorted(list(tokens_dir_path.glob(LZ4_GLOB)))
-    # bp()
+
     # tokens_file_paths = sorted(list(tokens_dir_path.glob("jsonl")))
     print("tokens_file_paths: ", tokens_file_paths)
     with log(f'Processing {len(tokens_file_paths)} tokens files'):
@@ -1142,21 +894,11 @@ def tokens_files_to_chunks_files(tokens_dir_path: Path, chunks_dir_path: Path, c
         # _tokens_file_to_chunks_files(tokens_file_paths[0], chunks_dir_path / tokens_file_paths[0].name, chunk_len)
         _parallel()(delayed(_tokens_file_to_chunks_files)(tokens_file_path,
                                                           Path(str(chunks_dir_path / tokens_file_path.name) + NPY_SUFFIX),
-                                                          chunk_len)
+                                                          chunk_len,tokenizer_info)
                     for tokens_file_path in track(tokens_file_paths))
 
 
-def _tokenize_doc(doc: str, tokenizer_cfg: DictConfig):
-    assert tokenizer_cfg
 
-    tokenized_doc_outer = tokenize(doc, tokenizer_cfg.name, tokenizer_cfg.repo_or_dir,
-                                   tokenizer_cfg.source, tokenizer_cfg.skip_validation, add_special_tokens=True,)
-    # get the tokens excluding the CLS and SEP that were added (== the original doc)
-    tokenized_doc = tokenized_doc_outer[0, 1:-1]
-    tokenized_doc[(tokenized_doc == CLS_TOKEN) | (tokenized_doc == SEP_TOKEN) |  # noqa: W504
-                  (tokenized_doc == PAD_TOKEN) | (tokenized_doc == MASK_TOKEN)] = UNK_TOKEN
-
-    return tokenized_doc_outer.tolist()[0]
 
 
 # TODO: this can be slow if the input files to jsonl_dir_to_docs_text_list_file were large (because only ||izes at file level)
@@ -1168,11 +910,20 @@ def _docs_files_to_tokens_file(docs_file_path, tokens_file_path: Path, tokenizer
     init_logging()
 
     with log(f'Tokenizing doc {docs_file_path.name}'):
-        with read_jsonl_file_no_compress(docs_file_path) as docs_reader, write_jsonl_file(tokens_file_path) as tokens_writer:
-            for doc_index, doc in tqdm(enumerate(docs_reader)):
-                tokens = _tokenize_doc(doc['text'], tokenizer_cfg)[:MAX_TOKENS]
+        
+        dataset = load_dataset("json",data_files=str(docs_file_path), streaming=True)["train"]
+        dataset = dataset.map(partial(_tokenize_dataset,tokenizer_cfg=tokenizer_cfg),batched=True)
+        dataset= dataset.select_columns(['tokens'])
+
+
+
+        with write_jsonl_file(tokens_file_path) as tokens_writer:
+            for doc_index, doc in tqdm(enumerate(dataset),):   
+                # tokens = _tokenize_doc(doc['text'], tokenizer_cfg)[:MAX_TOKENS]
+                # [rangehow]: 移除最大tokens的限制，没必要在这里做，这个把sep都给去掉了，简直是bug。
+                # tokens = _tokenize_doc(doc['text'], tokenizer_cfg)
                 # swj change
-                tokens_writer.write({'tokens': tokens})
+                tokens_writer.write({'tokens': doc["tokens"]})
 
 
 def docs_files_to_tokens_files(docs_dir_path: Path, tokens_dir_path: Path, tokenizer_cfg: DictConfig):
@@ -1181,13 +932,23 @@ def docs_files_to_tokens_files(docs_dir_path: Path, tokens_dir_path: Path, token
     assert tokenizer_cfg is not None
 
     # swj
+    # docs_file_paths = sorted(list(docs_dir_path.glob("*.jsonl")))
+    
     docs_file_paths = sorted(list(docs_dir_path.glob("*.jsonl")))
     # docs_file_paths = sorted(list(docs_dir_path.glob(LZ4_GLOB)))
 
-    # bp()
     with log(f'Tokenizing {len(docs_file_paths)} documents'):
         # debugging: _docs_files_to_tokens_file(docs_file_paths[0], tokens_dir_path / docs_file_paths[0].name, tokenizer_cfg)
         # _docs_files_to_tokens_file(docs_file_paths[0], tokens_dir_path / docs_file_paths[0].name, tokenizer_cfg)
+
+        
+
+        # dataset = load_dataset("json",data_files=docs_file_paths, streaming=True)["train"]
+        # dataset = dataset.map(_tokenize_dataset,batched=True)
+
+        
+        # [rangehow]: 这个函数写的蠢到姥姥家了，受不了一点。在文件之间开启进程，在文件内使用单进程，甚至还是串行tokenize。一个文件稍微长点都得编1896天。
+        # [rangehow]: 现在已经改成batch tokenize了，如果在外面整体的形成datasets，倒是可以整体多进程，只是文件名不好处理，如果不影响速度就不管这里。
         _parallel()(delayed(_docs_files_to_tokens_file)(docs_file_path, tokens_dir_path / docs_file_path.name, tokenizer_cfg) for docs_file_path in track(docs_file_paths))
 
 

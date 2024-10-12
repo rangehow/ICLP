@@ -1,87 +1,43 @@
-source_path: ../data/b3g_large
+source_path: ../data/fineweb_edu
 base_path:  ../output/embed
-dataset_name: b3g_large
+dataset_name: fineweb_edu_500
 
 tokens:
-  generate: false
+  generate: True
   tokenizer:
-    name: facebook/contriever-msmarco
-    repo_or_dir: ../lib/huggingface_pytorch-transformers_main
-    skip_validation: true
-    source: local
+    name: BAAI/bge-large-en-v1.5
 
+# 疑似没用的参数，但先别删，因为我还没有剥离这个,而且不知道后面会不会用到这个标记
 sequences:
-  seq_len: 5100
+  seq_len: 5120
 
 # max length of contriever is 512
+# 项目里会在某些地方给tensor加上两个额外的token,开头[CLS]和结尾的[SEP].项目里目前只支持bert like embed
 chunks:
-  generate: true
-  chunk_len: 510
+  generate: True
+  chunk_len: null
 
 embeddings:
   generate: true
-  batch_size: 128
-  embed_dim: 768
+  batch_size: 32
+  # rangehow: useless,现在自动推断
+  # embed_dim: 1024
   model:
-    name: facebook/contriever-msmarco
-    repo_or_dir: ../lib/huggingface_pytorch-transformers_main
-    skip_validation: true
-    source: local
+    name: BAAI/bge-large-en-v1.5
+    # rangehow: 不需要设置，**这个文件里的null说明这个参数会被用到，但是得靠文件推断**。
+    device: null
+    # useless
+    # repo_or_dir: ../lib/huggingface_pytorch-transformers_main
+    # skip_validation: true
+    # source: local
   parallel:
-    num_workers: 2
+    num_workers: 8
     submitit:
       submitit_path: ../output/submitit
       cluster: null
       partition: learnlab 
-      cpus_per_task: 5
-      gpus_per_node: 1
+      cpus_per_task: 4
+      # 一个节点上有几个gpu，通常是8
+      gpus_per_node: 8
       slurm_time: 18
       slurm_job_name: embedding-generation
-
-
-### The following part is not used in the current version. Please ignore it.
-documents:
-  generate: false
-  glob: "*jsonl"
-  source_path: /fsx-instruct-opt/swj0419/llama_data/embed/b3g_tmp
-
-
-index:
-  generate: false
-  # if generate is true, exactly one of index_reference and index_string should be specified
-  # flat is at present the only supported index_string
-  index_string: flat
-  index_reference:
-  # index_reference: dataset_name=5g/tokenizer=bert-base-cased/seq_len=2048/chunk_len=64/model=bert-base-cased/index_string=flat
-  # index_reference: dataset_name=wikitext-103-train/tokenizer=bert-base-cased/seq_len=2048/chunk_len=64/model=bert-base-cased/index_string=flat
-  # index_reference: dataset_name=1g/tokenizer=bert-base-cased/seq_len=2048/chunk_len=64/model=bert-base-cased/index_string=flat
-
-precalculated_knns:
-  generate: false
-  # batch size with which to query faiss
-  # TODO: tune this parameter
-  batch_size: 4096
-  # TODO: rename to K perhaps
-  k: 50
-  enable_gpu: true
-
-tfds_dataset:
-  generate: false
-  # with the below, we have the dataset name: {dataset_name}_{tokenizer_name}_{seq_len}_{chunk_len}_{model_name}_{index_string}_{K}_{k}
-  # e.g. 1t-0_facebook_contriever_2048_512_facebook_contriever_flat_50_5
-  k: 5
-  log_to_jsonl_every: 1
-  parallel:
-    distribute: False # swj change later
-    num_workers_per_file: 1
-    submitit:
-      submitit_path: /private/home/swj0419/rlm_pretrain/submitit
-      cluster: null
-      partition: learnlab
-      cpus_per_task: 3
-      gpus_per_node: 1
-      slurm_mem: 32G
-      slurm_constraint: null
-      slurm_time: 3600
-      slurm_job_name: retro-tfds-generation
-
