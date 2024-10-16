@@ -39,6 +39,10 @@ python retro_z_data.py --config-name example_config
 - Output embedding directory is set in `base_path`.
 - The program submits jobs using the slurm system. Configure slurm settings in lines 30-39 of `example_config`.
 
+安装milvus的批量写入包
+```bash
+pip3 install "pymilvus[bulk_writer]"
+```
 
 #### Efficient kNN search
 ** Please see the installation section to add faiss as a submodule in order to run this section**

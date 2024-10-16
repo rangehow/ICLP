@@ -93,15 +93,15 @@ def generate_embeddings(cfg: DictConfig,tokenizer_info):
         #                                  cfg.chunks.chunk_len, cfg.embeddings.batch_size, cfg.embeddings.embed_dim)
         # 1/0
         # bp()
-        if cfg.embeddings.parallel.num_workers == 1:
-            chunks_files_to_embeds_files(get_chunks_dir_path(cfg), embeddings_dir_path, cfg.embeddings.model,
-                                         cfg.chunks.chunk_len, cfg.embeddings.batch_size,tokenizer_info)
-        else:
-            # bp()
-            print("parallel")
-            parallel_chunks_files_to_embeds_files(get_chunks_dir_path(cfg), embeddings_dir_path, cfg.embeddings.batch_size,
-                                                  cfg.embeddings.model, cfg.chunks.chunk_len,
-                                                  cfg.embeddings.parallel,tokenizer_info)
+        # if cfg.embeddings.parallel.num_workers == 1:
+        #     chunks_files_to_embeds_files(get_chunks_dir_path(cfg), embeddings_dir_path, cfg.embeddings.model,
+        #                                  cfg.chunks.chunk_len, cfg.embeddings.batch_size,tokenizer_info)
+        # else:
+        #     # bp()
+        print("parallel")
+        parallel_chunks_files_to_embeds_files(get_chunks_dir_path(cfg), embeddings_dir_path, cfg.embeddings.batch_size,
+                                                cfg.embeddings.model, cfg.chunks.chunk_len,
+                                                cfg.embeddings.parallel,tokenizer_info)
 
 
 def generate_chunks(cfg: DictConfig,tokenizer_info):

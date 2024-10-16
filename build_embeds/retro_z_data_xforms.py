@@ -113,9 +113,7 @@ def get_bert(
 )->SentenceTransformer:
 
     
-    print(torch.cuda.is_available())
-    print(torch.cuda.device_count())
-    print(torch.cuda.current_device())
+
     print("device",device)
     model = SentenceTransformer(name,trust_remote_code=True,device=f"cuda:{device}" if device is not None else "cpu")
     print(model.device)
