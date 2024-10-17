@@ -77,7 +77,7 @@ knn file指向上一步生成的近邻npy，text file指向最开始的纯文本
 cd sort/
 python sort.py --knn_file build_index/lite/nearest_neighbors_ids.npy --text_file data/fineweb_edu/fineweb_edu_500.jsonl
 ```
-
+python sort.py --knn_file /mnt/rangehow/in-context-pretraining/output/embed/fineweb_edu_500/tokenizer-BAAI_bge_large_en_v1.5/seq_len-5120/chunk_len-512/model-BAAI_bge_large_en_v1.5/nearest_neighbors.npy --text_file ../data/fineweb_edu/fineweb_edu_500.jsonl
 
 
 
