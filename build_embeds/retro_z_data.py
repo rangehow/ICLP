@@ -136,7 +136,7 @@ def validate_config_interdependencies(cfg: DictConfig):
     assert (cfg.sequences.seq_len % cfg.chunks.chunk_len) == 0, 'Sequence length must be divisible by chunk size'
 
 
-@hydra.main(config_path="configs", config_name="retro_z_data_llama", version_base="1.2")
+@hydra.main(config_path="configs", config_name="example_config", version_base="1.2")
 def main(cfg: DictConfig):
     init_logging()
     logging.info(f'Executing with config:\n {pprint.pformat(OmegaConf.to_object(cfg))}')

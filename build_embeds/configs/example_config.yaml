@@ -1,6 +1,6 @@
-source_path: ../data/fineweb_edu
-base_path:  ../output/embed
-dataset_name: fineweb_edu_500
+source_path: ../data/fineweb_edu_10w # 用于指定数据文件夹，数据文件下所有的jsonl文件都会被使用
+base_path:  ../output/embed # 输出路径
+dataset_name: fineweb_edu_10w # 只是输出路径的一个标识，输出路径由tokenizer和dataset_name一起形成
 
 tokens:
   generate: True
@@ -19,12 +19,12 @@ chunks:
 
 embeddings:
   generate: true
-  batch_size: 32
+  batch_size: 128
   # rangehow: useless,现在自动推断
   # embed_dim: 1024
   model:
     name: BAAI/bge-large-en-v1.5
-    # rangehow: 不需要设置，**这个文件里的null说明这个参数会被用到，但是得靠文件推断**。
+    # rangehow: 不需要设置，**这个文件里的null说明这个参数会被用到，但是已经全部实现了自动推断**。
     device: null
     # useless
     # repo_or_dir: ../lib/huggingface_pytorch-transformers_main
@@ -39,5 +39,5 @@ embeddings:
       cpus_per_task: 4
       # 一个节点上有几个gpu，通常是8
       gpus_per_node: 8
-      slurm_time: 18
+      slurm_time: 14-00:00:00
       slurm_job_name: embedding-generation

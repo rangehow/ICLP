@@ -1,3 +1,5 @@
+import asyncio
+import subprocess
 from dataclasses import dataclass
 from functools import partial
 import multiprocessing
@@ -186,6 +188,11 @@ CHUNK_BATCH_SIZE = 1024
 
 # >= 50 means print stdout
 JOBLIB_VERBOSITY = 50
+
+
+
+import multiprocessing
+
 
 
 
@@ -721,6 +728,7 @@ def _parallel_chunks_file_to_embed_file(chunks_file_path: Path, embeds_file_path
 
         try:
             with log('Waiting for jobs to complete'):
+                # asyncio.run(await_completion_of_jobs(jobs))
                 await_completion_of_jobs(jobs)
             with log('Fetching and validating results'):
                 processed_chunks = fetch_and_validate_embedding_results(jobs)
@@ -909,8 +917,9 @@ def _docs_files_to_tokens_file(docs_file_path, tokens_file_path: Path, tokenizer
 
     with log(f'Tokenizing doc {docs_file_path.name}'):
         
+
         dataset = load_dataset("json",data_files=str(docs_file_path), streaming=True)["train"]
-        dataset = dataset.map(partial(_tokenize_dataset,tokenizer_cfg=tokenizer_cfg),batched=True)
+        dataset = dataset.map(partial(_tokenize_dataset,tokenizer_cfg=tokenizer_cfg),batched=True,batch_size=10000)
         dataset= dataset.select_columns(['tokens'])
 
 

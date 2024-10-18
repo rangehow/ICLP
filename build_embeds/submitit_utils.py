@@ -1,3 +1,4 @@
+import asyncio
 from omegaconf import DictConfig
 import functools
 import submitit
@@ -22,7 +23,7 @@ def create_executor(submitit_cfg: DictConfig):
 
     executor.update_parameters(cpus_per_task=submitit_cfg.cpus_per_task, gpus_per_node=submitit_cfg.gpus_per_node,
                                slurm_partition=submitit_cfg.partition, slurm_time=submitit_cfg.slurm_time,
-                               slurm_job_name=submitit_cfg.slurm_job_name)
+                               slurm_job_name=submitit_cfg.slurm_job_name,timeout_min=int(1e9))
     # slurm_mem=submitit_cfg.slurm_mem, slurm_constraint=submitit_cfg.slurm_constraint
 
     excludes = os.environ.get('SLURM_EXCLUDE', None)
@@ -31,6 +32,7 @@ def create_executor(submitit_cfg: DictConfig):
         executor.update_parameters(slurm_exclude=excludes)
 
     return executor
+
 
 
 def await_completion_of_jobs(jobs):
@@ -54,7 +56,6 @@ def await_completion_of_jobs(jobs):
         # progress.update(task, completed=num_complete)
         if num_complete == len(jobs):
             break
-
 
 def fetch_and_validate_embedding_results(jobs):
     # job.results() is broken
