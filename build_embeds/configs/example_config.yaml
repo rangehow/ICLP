@@ -1,6 +1,6 @@
-source_path: ../data/fineweb_edu_10w # 用于指定数据文件夹，数据文件下所有的jsonl文件都会被使用
+source_path: ../data/fineweb_edu # 用于指定数据文件夹，数据文件下所有的jsonl文件都会被使用
 base_path:  ../output/embed # 输出路径
-dataset_name: fineweb_edu_10w # 只是输出路径的一个标识，输出路径由tokenizer和dataset_name一起形成
+dataset_name: fineweb_edu # 只是输出路径的一个标识，输出路径由tokenizer和dataset_name一起形成
 
 tokens:
   generate: True
@@ -18,7 +18,7 @@ chunks:
   chunk_len: null
 
 embeddings:
-  generate: true
+  generate: True
   batch_size: 128
   # rangehow: useless,现在自动推断
   # embed_dim: 1024
@@ -31,13 +31,16 @@ embeddings:
     # skip_validation: true
     # source: local
   parallel:
-    num_workers: 8
+    num_workers: 4
     submitit:
       submitit_path: ../output/submitit
       cluster: null
       partition: learnlab 
-      cpus_per_task: 4
+      cpus_per_task: 8
       # 一个节点上有几个gpu，通常是8
-      gpus_per_node: 8
+      gpus_per_node: 4
       slurm_time: 14-00:00:00
       slurm_job_name: embedding-generation
+
+# 完备性检查，很快，没啥耗时，建议开启。
+enable_completeness_check: True

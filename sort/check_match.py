@@ -138,15 +138,18 @@ def data_stats(clusterid2docids):
     clusterid2count  = {}
     total_docs = 0
     cluster_21 = 0
+    max_v=0
     for k, v in tqdm(clusterid2docids.items()):
         clusterid2count[k] = len(v)
         total_docs += len(v)
         if len(v) >= 21:
             cluster_21 += 1
+        max_v=max(max_v,len(v))
     count_list = list(clusterid2count.values())
     q = statistics.quantiles(count_list, n=100)
     print(f"quantiles 25%: {q[25]}, 50%: {q[50]}, 75%: {q[75]}")
     print(f"total_docs: ", total_docs)
+    print(f"max cluster:{max_v}")
     # number of clusters with more than 21 docs:
     useful_cluster = len([i for i in count_list if i >= 21])
     # bp()

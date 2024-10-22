@@ -1,5 +1,27 @@
 # in-context-pretraining
 
+
+
+## 更新日志
+### 2024/10/21
+
+- 在build_embeds这一步中加入了完备性检查参数enable_completeness_check，可以在配置文件里设置，建议开启。
+- 在面对北哥那面的数据集时，抽出一条判断需不需要做处理，见retro_z_data_xforms.py：
+    ```python 
+        trick_instance= dataset.take(1)
+        if "##@@B" in trick_instance:
+            dataset = dataset.map(
+                partial(_preprocess_dataset), batched=True, batch_size=10000
+            )
+    ``` 
+    具体的处理逻辑可以在_preprocess_dataset调整。
+- 第一步build_embeds自动跳过已经处理好的文件，即使generate设置为True也会检测是否已经生成过完全相同配置的各种文件
+- 在build index尝试使用gpu搜索，大幅度提速，只在10w级试验过不会爆显存。
+- 修复了sort.py的大量不正确行为。包括merge，以及保存逻辑。
+- 边角bug，不完备的索引类型在极小样本比如500上有可能会返回-1，在sort内加入考虑了这种情况。同时小于10万的都采用完备搜索。
+- 在第二第三步许多的完备检测代码，暂不赘述。
+#### NOTE
+- 检查出一些向量的最近邻即使在确定的索引类型下也不是自己，这是因为潜在的原始文档重复/或前512个token重复问题。
 ## Installation
 
 Add faiss as a submodule when cloning the repo (we require the [faiss OIVFBBS code](https://github.com/facebookresearch/faiss/tree/main/demos/offline_ivf]) that is not included in the faiss conda package in the demos folder):
