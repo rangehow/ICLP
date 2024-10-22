@@ -106,12 +106,19 @@ def get_tokenizer(tokenizer_cfg: DictConfig):
 
 
 def _preprocess_dataset(instance):
-    return {"text":list(map(lambda x:x.strip().split("##@@B")[1].replace("_nl_", "\n"), instance["text"]))}
+    return {
+        "text": list(
+            map(
+                lambda x: x.strip().split("##@@B")[1].replace("_nl_", "\n"),
+                instance["text"],
+            )
+        )
+    }
+
 
 def _tokenize_dataset(instance, tokenizer_cfg):
     tokenizer, tokenizer_info = get_tokenizer(tokenizer_cfg)
 
-    
     tokenized_doc_outer = tokenizer.batch_encode_plus(
         instance["text"],
         add_special_tokens=True,
@@ -930,8 +937,7 @@ def parallel_chunks_files_to_embeds_files(
         if os.path.exists(embeds_dir_path / chunks_file_path.name):
             print(f"skip processing {embeds_dir_path / chunks_file_path.name}")
             chunks_file_paths.remove(chunks_file_path)
-    
-    
+
     with log(f"Processing {len(chunks_file_paths)} chunks files"):
         for chunks_file_path in chunks_file_paths:
             _parallel_chunks_file_to_embed_file(
@@ -1061,7 +1067,7 @@ def _create_chunks_and_map(
             # [rangehow]: 解除一个文档只能映射到一个chunk上的限制
             if div != 1:
                 bp()
-            assert div == 1
+            assert div == 1, "目前的截断设置下，一个文档不能对应多个chunk"
             for doc_chunk_index in range(div):
                 tokens_slice = slice(
                     doc_chunk_index * chunk_len, (doc_chunk_index + 1) * chunk_len
@@ -1075,7 +1081,7 @@ def _create_chunks_and_map(
                 chunk_index += 1
             # print("chunk_index: ", chunk_index, "doc_id: ", line["doc_id"])
             # assert chunk_index == line["doc_id"]+1
-    assert chunk_index == total_chunks
+    assert chunk_index == total_chunks, "目前的截断设置下，一个文档不能对应多个chunk"
 
 
 def _tokens_file_to_chunks_files(
@@ -1121,13 +1127,14 @@ def tokens_files_to_chunks_files(
 
     for tokens_file_path in tokens_file_paths:
         if os.path.exists(str(chunks_dir_path / tokens_file_path.name) + NPY_SUFFIX):
-            print(f"skip processing {str(chunks_dir_path / tokens_file_path.name) + NPY_SUFFIX}")
+            print(
+                f"skip processing {str(chunks_dir_path / tokens_file_path.name) + NPY_SUFFIX}"
+            )
             tokens_file_paths.remove(tokens_file_path)
-    
-    
+
     with log(f"Processing {len(tokens_file_paths)} tokens files"):
         # for debugging:
-        # _tokens_file_to_chunks_files(tokens_file_paths[0], chunks_dir_path / tokens_file_paths[0].name, chunk_len,tokenizer_info)
+
         _parallel()(
             delayed(_tokens_file_to_chunks_files)(
                 tokens_file_path,
@@ -1150,19 +1157,21 @@ def _docs_files_to_tokens_file(
     init_logging()
 
     with log(f"Tokenizing doc {docs_file_path.name}"):
-
-        dataset = load_dataset("json", data_files=str(docs_file_path), streaming=True)[
+        # , streaming=True
+        dataset = load_dataset("json", data_files=str(docs_file_path))[
             "train"
         ]
-        trick_instance= dataset.take(1)
+        
+        trick_instance = dataset.take(1)
         if "##@@B" in trick_instance:
             dataset = dataset.map(
-                partial(_preprocess_dataset), batched=True, batch_size=10000
+                partial(_preprocess_dataset), batched=True, batch_size=10000,num_proc=multiprocessing.cpu_count()
             )
         dataset = dataset.map(
             partial(_tokenize_dataset, tokenizer_cfg=tokenizer_cfg),
             batched=True,
-            batch_size=10000,
+
+            num_proc=multiprocessing.cpu_count()
         )
         dataset = dataset.select_columns(["tokens"])
 
@@ -1175,7 +1184,6 @@ def _docs_files_to_tokens_file(
                 # tokens = _tokenize_doc(doc['text'], tokenizer_cfg)
                 # swj change
                 tokens_writer.write({"tokens": doc["tokens"]})
-
 
 
 def docs_files_to_tokens_files(
@@ -1191,28 +1199,30 @@ def docs_files_to_tokens_files(
     docs_file_paths = sorted(list(docs_dir_path.glob("*.jsonl")))
 
     # 跳过已经处理好的文件
-    
+
     for docs_file_path in docs_file_paths:
         if os.path.exists(tokens_dir_path / docs_file_path.name):
             print(f"skip processing {tokens_dir_path / docs_file_path.name}")
             docs_file_paths.remove(docs_file_path)
-            
+
     # docs_file_paths = sorted(list(docs_dir_path.glob(LZ4_GLOB)))
     with log(f"Tokenizing {len(docs_file_paths)} documents"):
         # debugging: _docs_files_to_tokens_file(docs_file_paths[0], tokens_dir_path / docs_file_paths[0].name, tokenizer_cfg)
-        # _docs_files_to_tokens_file(docs_file_paths[0], tokens_dir_path / docs_file_paths[0].name, tokenizer_cfg)
+        
+        if len(docs_file_paths)==1:
+            _docs_files_to_tokens_file(docs_file_paths[0], tokens_dir_path / docs_file_paths[0].name, tokenizer_cfg)
+        else:
+            # dataset = load_dataset("json",data_files=docs_file_paths, streaming=True)["train"]
+            # dataset = dataset.map(_tokenize_dataset,batched=True)
 
-        # dataset = load_dataset("json",data_files=docs_file_paths, streaming=True)["train"]
-        # dataset = dataset.map(_tokenize_dataset,batched=True)
-
-        # [rangehow]: 这个函数写的蠢到姥姥家了，受不了一点。在文件之间开启进程，在文件内使用单进程，甚至还是串行tokenize。一个文件稍微长点都得编1896天。
-        # [rangehow]: 现在已经改成batch tokenize了，如果在外面整体的形成datasets，倒是可以整体多进程，只是文件名不好处理，如果不影响速度就不管这里。
-        _parallel()(
-            delayed(_docs_files_to_tokens_file)(
-                docs_file_path, tokens_dir_path / docs_file_path.name, tokenizer_cfg
+            # [rangehow]: 这个函数写的蠢到姥姥家了，受不了一点。在文件之间开启进程，在文件内使用单进程，甚至还是串行tokenize。一个文件稍微长点都得编1896天。
+            # [rangehow]: 现在已经改成batch tokenize了，如果在外面整体的形成datasets，倒是可以整体多进程，只是文件名不好处理，如果不影响速度就不管这里。
+            _parallel()(
+                delayed(_docs_files_to_tokens_file)(
+                    docs_file_path, tokens_dir_path / docs_file_path.name, tokenizer_cfg
+                )
+                for docs_file_path in track(docs_file_paths)
             )
-            for docs_file_path in track(docs_file_paths)
-        )
 
 
 def _copy_and_compress(source_file_path: Path, target_file_path: Path):

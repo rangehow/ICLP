@@ -1,6 +1,6 @@
-source_path: ../data/fineweb_edu # 用于指定数据文件夹，数据文件下所有的jsonl文件都会被使用
+source_path: ../data/fineweb_edu_100w # 用于指定数据文件夹，数据文件下所有的jsonl文件都会被使用
 base_path:  ../output/embed # 输出路径
-dataset_name: fineweb_edu # 只是输出路径的一个标识，输出路径由tokenizer和dataset_name一起形成
+dataset_name: fineweb_edu_100w # 只是输出路径的一个标识，输出路径由tokenizer和dataset_name一起形成
 
 tokens:
   generate: True
@@ -18,7 +18,7 @@ chunks:
   chunk_len: null
 
 embeddings:
-  generate: True
+  generate: False
   batch_size: 128
   # rangehow: useless,现在自动推断
   # embed_dim: 1024
@@ -31,7 +31,7 @@ embeddings:
     # skip_validation: true
     # source: local
   parallel:
-    num_workers: 4
+    num_workers: 8
     submitit:
       submitit_path: ../output/submitit
       cluster: null

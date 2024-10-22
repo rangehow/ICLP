@@ -196,25 +196,27 @@ class sort_class():
         output_folder = f"{self.output_file}/data"
         Path(output_folder).mkdir(parents=True, exist_ok=True)
         
-        num_processes = 32
-        # chunks = self.divide_into_chunks(sort_doc, num_processes)
+        num_processes =  multiprocessing.cpu_count()
+        chunks = self.divide_into_chunks(sort_doc, num_processes)
         
-        args_list = [(chunk, i) for i, chunk in enumerate(sort_doc)]
-
+        args_list = [(chunk, start_idx) for start_idx, chunk in enumerate(chunks)]
+        
         print(f"data ready: ", len(args_list))
         with multiprocessing.Pool(processes=num_processes) as pool:
-            for _ in tqdm(pool.imap(self.write_docs_wrapper, args_list), total=len(args_list)):
+            for _ in tqdm(pool.imap_unordered(self.write_docs_wrapper, args_list), total=len(args_list)):
                 pass
 
     def divide_into_chunks(self, lst, n):
-        batch_size = len(lst) // n
-        for i in range(0, len(lst), batch_size):
-            yield lst[i:i + batch_size]
+        n = min(n, len(lst))  # 确保 n 不大于列表长度
+        for i in range(n):
+            start = i * len(lst) // n
+            end = (i + 1) * len(lst) // n
+            yield lst[start:end]
 
     def write_docs_wrapper(self, args):
         return self.write_docs_single(*args)
 
-    def write_docs_single(self, sort_doc_chunk, file_index):
+    def write_docs_single(self, sort_doc_chunks, file_index):
         output_folder = f"{self.output_file}/data"
         prev_doc = None
         filter_docs = []
@@ -222,23 +224,36 @@ class sort_class():
         with open(self.text_file, 'r') as text_file:
             docs = text_file.readlines()
         
-        with open(f"{output_folder}/train_{file_index}.jsonl", "w") as f:
+        for chunk_index, sort_doc_chunk in enumerate(sort_doc_chunks):
+            output_data = []
+            
             for doc_id in tqdm(sort_doc_chunk):
-                doc = json.loads(docs[doc_id])
-                if prev_doc is not None:
-                    try:
-                        doc_sim = ngram_similarity(doc[self.text_key][:100], prev_doc[self.text_key][:100], self.n)
-                    except:
-                        print("None doc")
-                        print(doc)
-                        filter_docs.append(self.cur_k)
-                        continue
-                    if doc_sim > self.doc_sim_threshold:
-                        filter_docs.append(self.cur_k)
-                        continue
-                f.write(json.dumps(doc) + "\n")
-                prev_doc = doc
-        print(f"filter docs: {len(filter_docs)}")
+                doc = docs[doc_id]
+                output_data.append(json.dumps(doc, separators=(',', ':')))
+            
+            # 为每个chunk写入单独的文件
+            current_file_index = file_index + chunk_index
+            with open(f"{output_folder}/train_{current_file_index}.jsonl", "w") as f:
+                f.write('\n'.join(output_data))
+        
+        
+        # with open(f"{output_folder}/train_{file_index}.jsonl", "w") as f:
+        #     for doc_id in tqdm(sort_doc_chunk):
+        #         doc = json.loads(docs[doc_id])
+        #         if prev_doc is not None:
+        #             try:
+        #                 doc_sim = ngram_similarity(doc[self.text_key][:100], prev_doc[self.text_key][:100], self.n)
+        #             except:
+        #                 print("None doc")
+        #                 print(doc)
+        #                 filter_docs.append(self.cur_k)
+        #                 continue
+        #             if doc_sim > self.doc_sim_threshold:
+        #                 filter_docs.append(self.cur_k)
+        #                 continue
+        #         f.write(json.dumps(doc) + "\n")
+        #         prev_doc = doc
+        # print(f"filter docs: {len(filter_docs)}")
 
     def cluster2list(self):
         self.cluster2docs = pickle.load(open(f"{self.output_file}/cluster2docs_merge.pk", "rb"))

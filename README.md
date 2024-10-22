@@ -3,6 +3,16 @@
 
 
 ## 更新日志
+
+### 2024/10/22
+
+- 去除sort的检查ngram逻辑，更细致的多进程处理
+- 提高了15x的tokenize速度，我嘞个豆啊！dataset本身就是mmap文件，没必要流式。
+
+
+
+
+
 ### 2024/10/21
 
 - 在build_embeds这一步中加入了完备性检查参数enable_completeness_check，可以在配置文件里设置，建议开启。
