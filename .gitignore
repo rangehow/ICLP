@@ -3,3 +3,4 @@ output/
 *.jsonl
 *.npy
 *.pk
+build_embeds/outputs
