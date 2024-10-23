@@ -870,7 +870,7 @@ def _parallel_chunks_file_to_embed_file(
 
     # rangehow: 不允许workers的数量超过gpu数量，因为我强行要求一个worker绑一个device（如果有gpu的话）
     assert parallel_cfg.num_workers <= torch.cuda.device_count()
-    bp()
+
     dataset = datasets.load_from_disk(tokens_file_path)
 
     with log(f"Processing file {tokens_file_path.name}"):
@@ -913,6 +913,7 @@ def _parallel_chunks_file_to_embed_file(
                         model,
                         chunk_len,
                         tokenizer_info,
+                        dataset,
                     )
                     p = mp.Process(target=worker)
                     processes.append(p)

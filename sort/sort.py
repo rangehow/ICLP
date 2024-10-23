@@ -192,7 +192,7 @@ class sort_class():
 
     def write_docs(self):
         sort_doc = self.cluster2list()
-
+        
         output_folder = f"{self.output_file}/data"
         Path(output_folder).mkdir(parents=True, exist_ok=True)
         
@@ -259,8 +259,6 @@ class sort_class():
         self.cluster2docs = pickle.load(open(f"{self.output_file}/cluster2docs_merge.pk", "rb"))
         sort_doc = []
         for cluster_id, docs in tqdm(self.cluster2docs.items()):
-            # 假设 docs 中的元素已经是 int 类型
-            # 如果不是，需要进行类型转换
             sort_doc.append(docs)
         return sort_doc
 
