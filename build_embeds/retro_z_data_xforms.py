@@ -3,6 +3,7 @@ import subprocess
 from dataclasses import dataclass
 from functools import partial
 import multiprocessing
+import datasets
 from einops import rearrange
 from joblib import delayed, Parallel
 from typing import List, Optional
@@ -22,10 +23,12 @@ import time
 import os
 from tqdm import tqdm
 from datasets import Dataset, load_dataset
+from datasets.distributed import split_dataset_by_node
+from torch.utils.data import DataLoader
 
 # rangehow: use sentence transformer instead of torch.hub
 from sentence_transformers import SentenceTransformer
-
+import multiprocessing as mp
 
 # TODO: pull these out of retrieval and break connection to that codebase
 import sys
@@ -122,7 +125,7 @@ def _tokenize_dataset(instance, tokenizer_cfg):
     tokenized_doc_outer = tokenizer.batch_encode_plus(
         instance["text"],
         add_special_tokens=True,
-        padding=False,
+        padding='max_length', # 因为删了chunk，所以要把这里补齐
         return_attention_mask=False,
         return_token_type_ids=False,
         truncation=True,
@@ -142,52 +145,23 @@ def get_bert(
         trust_remote_code=True,
         device=f"cuda:{device}" if device is not None else "cpu",
     )
-    print(model.device)
+    print("model was loaded on :", model.device)
     return model
 
 
 @torch.no_grad()
 def bert_embed(
     token_ids,
-    return_cls_repr=False,
-    eps=1e-8,
     pad_id=0.0,
-    model_config: Optional[DictConfig] = None,
     bert: SentenceTransformer = None,
 ):
 
-    # if model is None:
-    #     model = get_bert(**model_config)
-    # else:
-    model = bert
-
     mask = token_ids != pad_id
 
-    # if torch.cuda.is_available():
-    token_ids = token_ids.to(model.device)
-    mask = mask.to(model.device)
-    print(model.device)
-    outputs = model(dict(input_ids=token_ids, attention_mask=mask))
-    # print(outputs.keys())
+    token_ids = token_ids.to(bert.device)
+    mask = mask.to(bert.device)
+    outputs = bert(dict(input_ids=token_ids, attention_mask=mask))
 
-    # rangehow: 原始做法，先屏蔽了
-    # hidden_state = outputs.hidden_states[-1]
-    # hidden_state = outputs["token_embeddings"]
-    # bp()
-    # if return_cls_repr:
-    #     return hidden_state[:, 0]  # return [cls] as representation
-
-    # if mask is None:
-    #     return hidden_state.mean(dim=1)
-
-    # mask = mask[:, 1:]  # mean all tokens excluding [cls], accounting for length
-    # mask = rearrange(mask, "b n -> b n 1")
-
-    # numer = (hidden_state[:, 1:] * mask).sum(dim=1)
-    # denom = mask.sum(dim=1)
-    # masked_mean = numer / (denom + eps)
-    # return masked_mean
-    # bp()
     return outputs["sentence_embedding"]
 
 
@@ -772,12 +746,17 @@ def _embed_chunk_batch(
     # print("padded_batch_torch.shape[1]",padded_batch_torch.shape[1])
     assert padded_batch_torch.shape[1] <= 512
 
-    batch_embed = bert_embed(padded_batch_torch, model_config=model, bert=bert)
+    batch_embed = bert_embed(
+        padded_batch_torch,
+        pad_id=tokenizer_info.pad_token,
+        model_config=model,
+        bert=bert,
+    )
     return batch_embed
 
 
 def _parallel_embed(
-    chunks_file_path: Path,
+    tokens_file_path: Path,
     embeds_file_path: Path,
     batch_size: int,
     num_workers: int,
@@ -785,18 +764,48 @@ def _parallel_embed(
     model: DictConfig,
     chunk_len: int,
     tokenizer_info,
+    dataset: Dataset,
 ):
 
     # 理论上，这是一个进程的内部
-    assert exists_and_is_file(chunks_file_path)
+    assert exists_and_is_dir(tokens_file_path)
     assert not embeds_file_path.is_dir()
     assert batch_size > 0
     assert num_workers > 0
 
     # assert chunk_len > 0 and chunk_len == 64
     assert model
+    OmegaConf.update(model, "device", worker_id, merge=True)
+    bert = get_bert(**model)
+    dataset = split_dataset_by_node(dataset, worker_id, num_workers)
 
-    with memmap(chunks_file_path, np.int32, "r") as chunks_flat:
+    def collate_fn(batch):
+        return torch.tensor([item["tokens"] for item in batch])
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=8,
+        collate_fn=partial(collate_fn),
+    )
+
+    emb_list = []
+    
+    for batch in tqdm(dataloader):
+        batch_embed = bert_embed(batch, pad_id=tokenizer_info.pad_token, bert=bert)
+        emb_list.append(batch_embed.detach().cpu().numpy())
+    
+    embeddings = np.vstack(emb_list)
+    with log(f"Worker {worker_id} writing embeddings"):
+        shard_filename = Path(
+            str(embeds_file_path) + f"_{worker_id}_{num_workers}.npy"
+        )
+        np.save(shard_filename, embeddings)
+    
+    return len(dataset), embeddings.shape[0]
+    
+    with memmap(chunks_file_path, np.int32, "r+") as chunks_flat:
         num_chunks, mod = divmod(len(chunks_flat), chunk_len)
         assert num_chunks > 0 and mod == 0
 
@@ -808,7 +817,7 @@ def _parallel_embed(
         start, end = shard_size * worker_id, shard_size * (worker_id + 1)
         shard = chunks[start:end]
 
-        emb_list = []
+        
 
         OmegaConf.update(model, "device", worker_id, merge=True)
         bert = get_bert(**model)
@@ -831,7 +840,7 @@ def _parallel_embed(
 
 
 def _parallel_chunks_file_to_embed_file(
-    chunks_file_path: Path,
+    tokens_file_path: Path,
     embeds_file_path: Path,
     batch_size: int,
     model: DictConfig,
@@ -851,7 +860,7 @@ def _parallel_chunks_file_to_embed_file(
         parallel_cfg (DictConfig): _description_
         tokenizer_info (TokenizerInfo): _description_
     """
-    assert exists_and_is_file(chunks_file_path)
+    assert exists_and_is_dir(tokens_file_path)
     assert not embeds_file_path.is_dir()
     assert batch_size > 0
     # assert embed_dim > 0
@@ -861,18 +870,42 @@ def _parallel_chunks_file_to_embed_file(
 
     # rangehow: 不允许workers的数量超过gpu数量，因为我强行要求一个worker绑一个device（如果有gpu的话）
     assert parallel_cfg.num_workers <= torch.cuda.device_count()
+    bp()
+    dataset = datasets.load_from_disk(tokens_file_path)
 
-    with log(f"Processing file {chunks_file_path.name}"):
+    with log(f"Processing file {tokens_file_path.name}"):
         num_workers = parallel_cfg.num_workers
+        processes = []
 
-        with log(f"Submitting {num_workers} jobs"):
-            executor = create_executor(parallel_cfg.submitit)
-            jobs = []
-            with executor.batch():
+        if num_workers == 1:
+            # 单进程直接执行
+            with log("Running in single process mode"):
+                worker = WorkerFunctor(
+                    _parallel_embed,
+                    tokens_file_path,
+                    embeds_file_path,
+                    batch_size,
+                    num_workers,
+                    0,  # worker_id = 0
+                    model,
+                    chunk_len,
+                    tokenizer_info,
+                    dataset,
+                )
+                worker()  # 直接调用，不创建新进程
+                # 直接读取并重命名唯一的分片文件
+                shard_filename = Path(str(embeds_file_path) + "_0_1.npy")
+                if not shard_filename.exists():
+                    raise RuntimeError(f"Output file {shard_filename} not found")
+                shard_filename.rename(embeds_file_path)
+
+        else:
+            with log(f"Starting {num_workers} processes"):
+                # 启动进程
                 for worker_id in range(num_workers):
-                    worker_fn = WorkerFunctor(
+                    worker = WorkerFunctor(
                         _parallel_embed,
-                        chunks_file_path,
+                        tokens_file_path,
                         embeds_file_path,
                         batch_size,
                         num_workers,
@@ -881,42 +914,55 @@ def _parallel_chunks_file_to_embed_file(
                         chunk_len,
                         tokenizer_info,
                     )
-                    job = executor.submit(worker_fn)
-                    jobs.append(job)
+                    p = mp.Process(target=worker)
+                    processes.append(p)
+                    p.start()
 
-        try:
-            with log("Waiting for jobs to complete"):
-                # asyncio.run(await_completion_of_jobs(jobs))
-                await_completion_of_jobs(jobs)
-            with log("Fetching and validating results"):
-                processed_chunks = fetch_and_validate_embedding_results(jobs)
+            try:
+                with log("Waiting for processes to complete"):
+                    # 等待所有进程完成
+                    for p in processes:
+                        p.join()
 
-            with log(f"Merging shards into {embeds_file_path}"):
-                with memmap(
-                    embeds_file_path,
-                    np.float32,
-                    "w+",
-                    shape=(processed_chunks, tokenizer_info.embed_dim),
-                ) as embeds:
-                    embeds_index = 0
-                    for worker_id in track(range(num_workers)):
+                with log("Validating results"):
+                    # 验证每个分片文件是否存在并获取总处理数量
+                    processed_chunks = 0
+                    for worker_id in range(num_workers):
                         shard_filename = Path(
                             str(embeds_file_path) + f"_{worker_id}_{num_workers}.npy"
                         )
-                        embeds_shard = np.load(shard_filename)
-                        embeds[embeds_index : embeds_index + len(embeds_shard)] = (
-                            embeds_shard
-                        )
-                        embeds_index += len(embeds_shard)
-                        shard_filename.unlink()
-        except Exception as e:
-            logging.critical(
-                f"Error while awaiting/fetching/merging results in file {chunks_file_path.name}:\n{e}"
-            )
+                        if not shard_filename.exists():
+                            raise RuntimeError(f"Shard file {shard_filename} not found")
+                        processed_chunks += len(np.load(shard_filename))
+
+                with log(f"Merging shards into {embeds_file_path}"):
+                    with memmap(
+                        embeds_file_path,
+                        np.float32,
+                        "w+",
+                        shape=(processed_chunks, tokenizer_info.embed_dim),
+                    ) as embeds:
+                        embeds_index = 0
+                        for worker_id in track(range(num_workers)):
+                            shard_filename = Path(
+                                str(embeds_file_path)
+                                + f"_{worker_id}_{num_workers}.npy"
+                            )
+                            embeds_shard = np.load(shard_filename)
+                            embeds[embeds_index : embeds_index + len(embeds_shard)] = (
+                                embeds_shard
+                            )
+                            embeds_index += len(embeds_shard)
+                            shard_filename.unlink()
+
+            except Exception as e:
+                logging.critical(
+                    f"Error while processing/merging results in file {tokens_file_path.name}:\n{e}"
+                )
 
 
 def parallel_chunks_files_to_embeds_files(
-    chunks_dir_path: Path,
+    tokens_dir_path: Path,
     embeds_dir_path: Path,
     batch_size: int,
     model: DictConfig,
@@ -924,25 +970,26 @@ def parallel_chunks_files_to_embeds_files(
     parallel_cfg: DictConfig,
     tokenizer_info: TokenizerInfo,
 ):
-    assert exists_and_is_dir(chunks_dir_path)
+    # assert exists_and_is_dir(tokens_dir_path)
     assert exists_and_is_dir(embeds_dir_path)
     assert batch_size > 0
 
     assert parallel_cfg
     assert model
+    
+    # tokens_file_paths = sorted(
+    #     [item for item in tokens_dir_path.iterdir() if item.is_dir()]
+    # )
+    for tokens_file_path in tokens_dir_path:
+        if os.path.exists(embeds_dir_path / tokens_file_path.name.rsplit(".")[0]):
+            print(f"skip processing {embeds_dir_path / tokens_file_path.name}")
+            tokens_dir_path.remove(tokens_file_path)
 
-    chunks_file_paths = sorted(list(chunks_dir_path.glob(NPY_GLOB)))
-
-    for chunks_file_path in chunks_file_paths:
-        if os.path.exists(embeds_dir_path / chunks_file_path.name):
-            print(f"skip processing {embeds_dir_path / chunks_file_path.name}")
-            chunks_file_paths.remove(chunks_file_path)
-
-    with log(f"Processing {len(chunks_file_paths)} chunks files"):
-        for chunks_file_path in chunks_file_paths:
+    with log(f"Processing {len(tokens_dir_path)} chunks files"):
+        for tokens_file_path in tokens_dir_path:
             _parallel_chunks_file_to_embed_file(
-                chunks_file_path,
-                embeds_dir_path / chunks_file_path.name,
+                tokens_file_path,
+                embeds_dir_path / tokens_file_path.name,
                 batch_size,
                 model,
                 chunk_len,
@@ -1002,6 +1049,7 @@ def chunks_files_to_embeds_files(
 
     chunks_file_paths = sorted(list(chunks_dir_path.glob(NPY_GLOB)))
     # bp()
+
     with log(f"Processing {len(chunks_file_paths)} chunks files"):
         for chunks_file_path in chunks_file_paths:
             _chunks_file_to_embed_file(
@@ -1135,15 +1183,23 @@ def tokens_files_to_chunks_files(
     with log(f"Processing {len(tokens_file_paths)} tokens files"):
         # for debugging:
 
-        _parallel()(
-            delayed(_tokens_file_to_chunks_files)(
-                tokens_file_path,
-                Path(str(chunks_dir_path / tokens_file_path.name) + NPY_SUFFIX),
+        if len(tokens_file_paths) == 1:
+            _tokens_file_to_chunks_files(
+                tokens_file_paths[0],
+                Path(str(chunks_dir_path / tokens_file_paths[0].name) + NPY_SUFFIX),
                 chunk_len,
                 tokenizer_info,
             )
-            for tokens_file_path in track(tokens_file_paths)
-        )
+        else:
+            _parallel()(
+                delayed(_tokens_file_to_chunks_files)(
+                    tokens_file_path,
+                    Path(str(chunks_dir_path / tokens_file_path.name) + NPY_SUFFIX),
+                    chunk_len,
+                    tokenizer_info,
+                )
+                for tokens_file_path in track(tokens_file_paths)
+            )
 
 
 # TODO: this can be slow if the input files to jsonl_dir_to_docs_text_list_file were large (because only ||izes at file level)
@@ -1158,32 +1214,36 @@ def _docs_files_to_tokens_file(
 
     with log(f"Tokenizing doc {docs_file_path.name}"):
         # , streaming=True
-        dataset = load_dataset("json", data_files=str(docs_file_path))[
-            "train"
-        ]
-        
+        dataset = load_dataset("json", data_files=str(docs_file_path))["train"]
+
         trick_instance = dataset.take(1)
         if "##@@B" in trick_instance:
             dataset = dataset.map(
-                partial(_preprocess_dataset), batched=True, batch_size=10000,num_proc=multiprocessing.cpu_count()
+                partial(_preprocess_dataset),
+                batched=True,
+                batch_size=10000,
+                num_proc=multiprocessing.cpu_count(),
             )
         dataset = dataset.map(
             partial(_tokenize_dataset, tokenizer_cfg=tokenizer_cfg),
             batched=True,
-
-            num_proc=multiprocessing.cpu_count()
+            num_proc=multiprocessing.cpu_count(),
         )
         dataset = dataset.select_columns(["tokens"])
 
-        with write_jsonl_file(tokens_file_path) as tokens_writer:
-            for doc_index, doc in tqdm(
-                enumerate(dataset),
-            ):
-                # tokens = _tokenize_doc(doc['text'], tokenizer_cfg)[:MAX_TOKENS]
-                # [rangehow]: 移除最大tokens的限制，没必要在这里做，这个把sep都给去掉了，简直是bug。
-                # tokens = _tokenize_doc(doc['text'], tokenizer_cfg)
-                # swj change
-                tokens_writer.write({"tokens": doc["tokens"]})
+        dataset.save_to_disk(
+            tokens_file_path.with_suffix(""), num_proc=multiprocessing.cpu_count()
+        )
+
+        # with write_jsonl_file(tokens_file_path) as tokens_writer:
+        #     for doc_index, doc in tqdm(
+        #         enumerate(dataset),
+        #     ):
+        #         # tokens = _tokenize_doc(doc['text'], tokenizer_cfg)[:MAX_TOKENS]
+        #         # [rangehow]: 移除最大tokens的限制，没必要在这里做，这个把sep都给去掉了，简直是bug。
+        #         # tokens = _tokenize_doc(doc['text'], tokenizer_cfg)
+        #         # swj change
+        #         tokens_writer.write({"tokens": doc["tokens"]})
 
 
 def docs_files_to_tokens_files(
@@ -1201,16 +1261,20 @@ def docs_files_to_tokens_files(
     # 跳过已经处理好的文件
 
     for docs_file_path in docs_file_paths:
-        if os.path.exists(tokens_dir_path / docs_file_path.name):
+        if os.path.exists(tokens_dir_path / docs_file_path.name.rsplit(".")[0]):
             print(f"skip processing {tokens_dir_path / docs_file_path.name}")
             docs_file_paths.remove(docs_file_path)
 
     # docs_file_paths = sorted(list(docs_dir_path.glob(LZ4_GLOB)))
     with log(f"Tokenizing {len(docs_file_paths)} documents"):
         # debugging: _docs_files_to_tokens_file(docs_file_paths[0], tokens_dir_path / docs_file_paths[0].name, tokenizer_cfg)
-        
-        if len(docs_file_paths)==1:
-            _docs_files_to_tokens_file(docs_file_paths[0], tokens_dir_path / docs_file_paths[0].name, tokenizer_cfg)
+
+        if len(docs_file_paths) == 1:
+            _docs_files_to_tokens_file(
+                docs_file_paths[0],
+                tokens_dir_path / docs_file_paths[0].name,
+                tokenizer_cfg,
+            )
         else:
             # dataset = load_dataset("json",data_files=docs_file_paths, streaming=True)["train"]
             # dataset = dataset.map(_tokenize_dataset,batched=True)

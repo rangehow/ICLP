@@ -63,8 +63,8 @@ def get_sequences_dir_path(cfg: DictConfig):
     return get_tokens_dir_path(cfg) / f"seq_len-{cfg.sequences.seq_len}"
 
 
-def get_chunks_dir_path(cfg: DictConfig):
-    return get_sequences_dir_path(cfg) / f"chunk_len-{cfg.chunks.chunk_len}"
+# def get_chunks_dir_path(cfg: DictConfig):
+#     return get_sequences_dir_path(cfg) / f"chunk_len-{cfg.chunks.chunk_len}"
 
 
 def get_normalized_model_name(cfg: DictConfig):
@@ -73,8 +73,8 @@ def get_normalized_model_name(cfg: DictConfig):
 
 
 def get_embeddings_dir_path(cfg: DictConfig):
-    return get_chunks_dir_path(cfg) / f"model-{get_normalized_model_name(cfg)}"
-
+    return get_tokens_dir_path(cfg) / f"model-{get_normalized_model_name(cfg)}"
+ 
 
 """
 index: PosixPath('/checkpoint/swj0419/dataset_name-1t-0/tokenizer-facebook_contriever/seq_len-2048/chunk_len-512/model-facebook_contriever/index_string-flat')
@@ -90,7 +90,8 @@ def generate_embeddings(cfg: DictConfig, tokenizer_info):
     with log("Generating embeddings"):
         embeddings_dir_path = get_embeddings_dir_path(cfg)
         os.makedirs(embeddings_dir_path, exist_ok=True)
-        print("get_chunks_dir_path(cfg): ", get_chunks_dir_path(cfg))
+        print("get_tokens_dir_path(cfg): ", get_tokens_dir_path(cfg))
+
         # # # swj: to be deleted
         # chunks_files_to_embeds_files(get_chunks_dir_path(cfg), embeddings_dir_path, cfg.embeddings.model,
         #                                  cfg.chunks.chunk_len, cfg.embeddings.batch_size, cfg.embeddings.embed_dim)
@@ -101,9 +102,11 @@ def generate_embeddings(cfg: DictConfig, tokenizer_info):
         #                                  cfg.chunks.chunk_len, cfg.embeddings.batch_size,tokenizer_info)
         # else:
         #     # bp()
-        print("parallel")
+        tokens_dir_path = [get_tokens_dir_path(cfg)/f.name.rsplit('.')[0] for f in sorted(list(get_source_dir_path(cfg).glob("*.jsonl")))]
+        
+
         parallel_chunks_files_to_embeds_files(
-            get_chunks_dir_path(cfg),
+            tokens_dir_path,
             embeddings_dir_path,
             cfg.embeddings.batch_size,
             cfg.embeddings.model,
@@ -113,17 +116,17 @@ def generate_embeddings(cfg: DictConfig, tokenizer_info):
         )
 
 
-def generate_chunks(cfg: DictConfig, tokenizer_info):
-    with log("Generating chunks"):
-        chunks_dir_path = get_chunks_dir_path(cfg)
-        os.makedirs(chunks_dir_path, exist_ok=True)
+# def generate_chunks(cfg: DictConfig, tokenizer_info):
+#     with log("Generating chunks"):
+#         chunks_dir_path = get_chunks_dir_path(cfg)
+#         os.makedirs(chunks_dir_path, exist_ok=True)
 
-        tokens_files_to_chunks_files(
-            get_tokens_dir_path(cfg),
-            chunks_dir_path,
-            cfg.chunks.chunk_len,
-            tokenizer_info,
-        )
+#         tokens_files_to_chunks_files(
+#             get_tokens_dir_path(cfg),
+#             chunks_dir_path,
+#             cfg.chunks.chunk_len,
+#             tokenizer_info,
+#         )
 
 
 def generate_tokens(cfg: DictConfig):
@@ -135,15 +138,6 @@ def generate_tokens(cfg: DictConfig):
             PosixPath(cfg.source_path), tokens_dir_path, cfg.tokens.tokenizer
         )
 
-
-def generate_documents(cfg: DictConfig):
-    with log("Generating documents"):
-        source_path = get_source_dir_path(cfg)
-        # bp()
-        globs = cfg.documents.glob
-        docs_dir_path = get_documents_dir_path(cfg)
-        os.makedirs(docs_dir_path, exist_ok=True)
-        import_docs(source_path, docs_dir_path, globs)
 
 
 def completeness_check(cfg, tokenizer_info):
@@ -180,6 +174,14 @@ def validate_config_interdependencies(cfg: DictConfig):
     ) == 0, "Sequence length must be divisible by chunk size"
 
 
+# from argparse import ArgumentParser
+# def parse_args():
+#     parser=ArgumentParser()
+#     parser.add_argument("")
+    
+#     return parser.parse_args()
+
+
 @hydra.main(config_path="configs", config_name="example_config", version_base="1.2")
 def main(cfg: DictConfig):
     init_logging()
@@ -207,8 +209,8 @@ def main(cfg: DictConfig):
         # 这个会创建一个二进制存储的分词文件，放在base_path/tokenizer_name/数据集.jsonl里面
         generate_tokens(cfg)
 
-    if cfg.chunks.generate:
-        generate_chunks(cfg, tokenizer_info)
+    # if cfg.chunks.generate:
+    #     generate_chunks(cfg, tokenizer_info)
 
     if cfg.embeddings.generate:
         # get_bert()
