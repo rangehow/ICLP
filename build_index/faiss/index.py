@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 # 设置参数
 EMBEDDING_DIM = 1024
-numpy_mmap_file_dir = "/mnt/rangehow/in-context-pretraining/output/embed/fineweb_edu_1w/tokenizer-BAAI_bge_large_en_v1.5/model-BAAI_bge_large_en_v1.5/fineweb_edu_500"
+numpy_mmap_file_dir = "/mnt/rangehow/in-context-pretraining/output/embed/fineweb_edu_500/tokenizer-BAAI_bge_large_en_v1.5/model-BAAI_bge_large_en_v1.5/fineweb_edu_500"
 BATCH_SIZE = 10000
 TOP_K = 50
 
