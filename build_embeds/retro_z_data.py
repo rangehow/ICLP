@@ -141,27 +141,34 @@ def generate_tokens(cfg: DictConfig):
 
 
 def completeness_check(cfg, tokenizer_info):
+    
     source_file_paths = sorted(list(get_source_dir_path(cfg).glob("*.jsonl")))
-    embed_file_paths = sorted(list(get_embeddings_dir_path(cfg).glob("*.npy")))
-    assert len(source_file_paths) == len(
-        embed_file_paths
-    ), f"原始文件数量：{len(source_file_paths)},生成的embeddings文件数量：{len(embed_file_paths)}"
+    embed_file_path = get_embeddings_dir_path(cfg)
+    
+    # 文件数量检查
+    for source_file in source_file_paths:
+        source_file_name = source_file.name.rsplit('.')[0]
+        if not os.path.exists(embed_file_path/source_file_name):
+            raise FileNotFoundError(f"原文件 {source_file} 对应的 embed 文件未找到")
+    
+    # 行数检查
 
-    for source_file, embed_file in zip(source_file_paths, embed_file_paths):
+    for source_file in source_file_paths:
         # 获取源文件的行数
         with open(source_file, "r", encoding="utf-8") as f:
             source_lines = sum(1 for _ in f)
 
+        source_file_name = source_file.name.rsplit('.')[0]
         # 获取embeddings文件的行数
-        embed_file_size = os.path.getsize(embed_file)
-        embed_dim = tokenizer_info.embed_dim  # 假设嵌入维度为768，如果不是请修改
+        embed_file_size = os.path.getsize(embed_file_path/source_file_name)
+        embed_dim = tokenizer_info.embed_dim 
         embed_dtype = np.float32  # 假设数据类型为float32，如果不是请修改
         embed_item_size = np.dtype(embed_dtype).itemsize * embed_dim
         embed_lines = embed_file_size // embed_item_size
 
         # 检查行数是否匹配
         assert source_lines == embed_lines, (
-            f"文件 {source_file.name} 和 {embed_file.name} 的行数不匹配。"
+            f"文件 {source_file.name} 的行数不匹配。"
             f"源文件行数：{source_lines}，embeddings行数：{embed_lines}"
         )
 

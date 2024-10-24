@@ -935,7 +935,7 @@ def _parallel_chunks_file_to_embed_file(
                         if not shard_filename.exists():
                             raise RuntimeError(f"Shard file {shard_filename} not found")
                         processed_chunks += len(np.load(shard_filename))
-
+                
                 with log(f"Merging shards into {embeds_file_path}"):
                     with memmap(
                         embeds_file_path,
@@ -944,7 +944,7 @@ def _parallel_chunks_file_to_embed_file(
                         shape=(processed_chunks, tokenizer_info.embed_dim),
                     ) as embeds:
                         embeds_index = 0
-                        for worker_id in track(range(num_workers)):
+                        for worker_id in range(num_workers):
                             shard_filename = Path(
                                 str(embeds_file_path)
                                 + f"_{worker_id}_{num_workers}.npy"
