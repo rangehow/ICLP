@@ -894,10 +894,10 @@ def _parallel_chunks_file_to_embed_file(
                 )
                 worker()  # 直接调用，不创建新进程
                 # 直接读取并重命名唯一的分片文件
-                shard_filename = Path(str(embeds_file_path) + "_0_1.npy")
-                if not shard_filename.exists():
-                    raise RuntimeError(f"Output file {shard_filename} not found")
-                shard_filename.rename(embeds_file_path)
+                # shard_filename = Path(str(embeds_file_path) + "_0_1.npy")
+                # if not shard_filename.exists():
+                #     raise RuntimeError(f"Output file {shard_filename} not found")
+                # shard_filename.rename(embeds_file_path)
 
         else:
             with log(f"Starting {num_workers} processes"):
@@ -919,47 +919,49 @@ def _parallel_chunks_file_to_embed_file(
                     processes.append(p)
                     p.start()
 
-            try:
+            
                 with log("Waiting for processes to complete"):
                     # 等待所有进程完成
                     for p in processes:
                         p.join()
 
-                with log("Validating results"):
-                    # 验证每个分片文件是否存在并获取总处理数量
-                    processed_chunks = 0
+        with log("Validating results"):
+            # 验证每个分片文件是否存在并获取总处理数量
+            processed_chunks = 0
+            for worker_id in range(num_workers):
+                shard_filename = Path(
+                    str(embeds_file_path) + f"_{worker_id}_{num_workers}.npy"
+                )
+                if not shard_filename.exists():
+                    raise RuntimeError(f"Shard file {shard_filename} not found")
+                processed_chunks += len(np.load(shard_filename))
+                
+            
+
+        try:    
+            with log(f"Merging shards into {embeds_file_path}"):
+                with memmap(
+                    embeds_file_path,
+                    np.float32,
+                    "w+",
+                    shape=(processed_chunks, tokenizer_info.embed_dim),
+                ) as embeds:
+                    embeds_index = 0
                     for worker_id in range(num_workers):
                         shard_filename = Path(
-                            str(embeds_file_path) + f"_{worker_id}_{num_workers}.npy"
+                            str(embeds_file_path)
+                            + f"_{worker_id}_{num_workers}.npy"
                         )
-                        if not shard_filename.exists():
-                            raise RuntimeError(f"Shard file {shard_filename} not found")
-                        processed_chunks += len(np.load(shard_filename))
-                
-                with log(f"Merging shards into {embeds_file_path}"):
-                    with memmap(
-                        embeds_file_path,
-                        np.float32,
-                        "w+",
-                        shape=(processed_chunks, tokenizer_info.embed_dim),
-                    ) as embeds:
-                        embeds_index = 0
-                        for worker_id in range(num_workers):
-                            shard_filename = Path(
-                                str(embeds_file_path)
-                                + f"_{worker_id}_{num_workers}.npy"
-                            )
-                            embeds_shard = np.load(shard_filename)
-                            embeds[embeds_index : embeds_index + len(embeds_shard)] = (
-                                embeds_shard
-                            )
-                            embeds_index += len(embeds_shard)
-                            shard_filename.unlink()
-
-            except Exception as e:
-                logging.critical(
-                    f"Error while processing/merging results in file {tokens_file_path.name}:\n{e}"
-                )
+                        embeds_shard = np.load(shard_filename)
+                        embeds[embeds_index : embeds_index + len(embeds_shard)] = (
+                            embeds_shard
+                        )
+                        embeds_index += len(embeds_shard)
+                        shard_filename.unlink()
+        except Exception as e:
+            logging.critical(
+                f"Error while processing/merging results in file {tokens_file_path.name}:\n{e}"
+            )
 
 
 def parallel_chunks_files_to_embeds_files(
